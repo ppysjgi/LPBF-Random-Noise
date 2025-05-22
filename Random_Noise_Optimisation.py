@@ -5,6 +5,7 @@ Spyder Editor
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.sparse import lil_matrix, csr_matrix
+import matplotlib.animation as animation
 
 #A program to predict the transient thermal response of a moving 2D heat source
 
@@ -17,10 +18,13 @@ def gaussian(x, y, mu_x, mu_y, sigma):
 
 
 # Parameters
-Lx, Ly = 100, 100  # Length of the plane in x and y directions
-T = 4.0   # Total time
-Nx, Ny = 500, 500  # Number of spatial points in x and y directions
-Nt = (np.rint(40*T)).astype(int)  # Number of time points
+Lx, Ly = 7, 7  # Reduce domain to focus on 5 mm track (+1 mm margin each side)
+Nx, Ny = 150, 150 
+dx = Lx / (Nx - 1)
+dy = Ly / (Ny - 1)
+dt = 0.000002
+T = 0.05   # Time for 5 mm at 100 mm/s = 0.05 s (adjust as needed)
+Nt = int(T / dt) + 1
 
 density = 7.8e-6 # kg/mm^3
 thermal_conductivity = 45e-3 # W/mmK
@@ -28,29 +32,23 @@ specific_heat = 420 # J/kgK
 
 alpha = thermal_conductivity/(specific_heat*density)  # Thermal diffusivity mm^2/s
 
-dx = Lx / (Nx - 1)
-dy = Ly / (Ny - 1)
-dt = T / (Nt - 1)
-
 thickness = 1 #plate thickness 
 
 # Parameters for the Gaussian#
 D1 = 0.080 # 80um beam diameter
-mu_x = 30
-mu_y = 30
+mu_x = 1  # Start 1 mm from left edge
+mu_y = Ly / 2  # Centered in y
 sigma = D1/2.355 # Standard deviation of the Gaussian beam
 
 
 # Moving heat source parameters
-source_amplitude = 200  # W/mm^2
+source_amplitude = 100  # Peak power (W)
+source_speed = 300  # mm/s
 
-source_speed = 30 # mm/s
-
-
+track_length = 5  # mm, length of the scan track
 
 # Coordinate Matrices
 x_mat, y_mat = np.meshgrid(np.linspace(0, Lx, Nx), np.linspace(0, Ly, Ny))
-
 
 # Initial temperature distribution
 u = np.zeros((Nt, Nx, Ny))
@@ -64,7 +62,7 @@ u[0,:,:] = np.ones((Nx, Ny))*initial_temperature
 heat_source_temp = gaussian(x_mat, y_mat, mu_x, mu_y, sigma)    
 heat_source_temp = heat_source_temp*source_amplitude
 heat_source[0,:,:] = heat_source_temp
-u_temp = heat_source_temp*(1/(dx*dy*thickness*density))*(1/specific_heat)
+u_temp = heat_source_temp * dt / (dx*dy*thickness*density*specific_heat)
 u[0, :, :] = u[0, :, :] + u_temp
 mu_y = mu_y + (source_speed*dt)
 
@@ -122,54 +120,51 @@ for i in range(1, Nx-1):
 T_track = 0
 
 # Time-stepping loop
-for n in range(1, Nt,1):
+for n in range(1, Nt, 1):
     b = u[n-1,:,:].flatten()
-    deltaT=A.dot(b)
-    T_new_flattened=b+(deltaT*dt)
-    u[n,:,:]=T_new_flattened.reshape((Nx, Ny))
-    T_track=T_track+dt
-    if T_track<2:
-        # Evaluate heat source
-        heat_source_temp = gaussian(x_mat, y_mat, mu_x, mu_y, sigma)    
-        heat_source_temp = heat_source_temp*source_amplitude
+    deltaT = A.dot(b)
+    T_new_flattened = b + (deltaT * dt)
+    u[n,:,:] = T_new_flattened.reshape((Nx, Ny))
+    T_track = T_track + dt
+    # Only apply heat source while within 5 mm track
+    if mu_x <= 1 + track_length:
+        heat_source_temp = gaussian(x_mat, y_mat, mu_x, mu_y, sigma)
+        heat_source_temp = heat_source_temp * source_amplitude
         heat_source[n,:,:] = heat_source_temp
-        # Apply heat source to temperature field
-        u_temp=heat_source_temp*(1/(dx*dy*thickness*density))*(1/specific_heat)
-        u[n, :, :]=u[n, :, :]+u_temp
-        #Ensure outer edge is constant temperature
-        u[n, 0, :]=initial_temperature
-        u[n, Nx-1, :]=initial_temperature
-        u[n, :, 0]=initial_temperature
-        u[n, :, Ny-1]=initial_temperature
-        # Update heat source location
-        mu_x=mu_x+(source_speed*dt)
-        mu_y=mu_y+(source_speed*dt)
+        u_temp = heat_source_temp * dt / (dx*dy*thickness*density*specific_heat)
+        u[n, :, :] = u[n, :, :] + u_temp
+        u[n, 0, :] = initial_temperature
+        u[n, Nx-1, :] = initial_temperature
+        u[n, :, 0] = initial_temperature
+        u[n, :, Ny-1] = initial_temperature
+        mu_x = mu_x + (source_speed * dt)
     print(n)
 
+# After the simulation loop
+max_temp = np.max(u)
+print(f"Maximum temperature reached during the scan: {max_temp:.2f} °C")
 
+# Set up the figure and axis for animation
+fig, ax = plt.subplots(figsize=(7, 6))
 vmin = 0
-vmax = 800
-colorbar_ticks = np.round(np.linspace(vmin, vmax, 6))
+vmax = int(np.ceil(max_temp / 500.0)) * 500 # Set vmax to the next highest multiple of 500 above max_temp
 
-# Create a single figure with subplots
-fig, axes = plt.subplots(nrows=2, ncols=5, figsize=(15, 6), constrained_layout=True)  # Adjust rows/cols as needed
-axes = axes.flatten()  # Flatten the 2D array of axes for easier indexing
-
-# Plot the results
-for idx, n in enumerate(range(0, Nt, 10)):
-    if idx >= len(axes):  # Ensure we don't exceed the number of subplots
-        break
-    ax = axes[idx]
-    contour = ax.contourf(x_mat, y_mat, u[n, :, :], cmap='hot', levels=np.linspace(vmin, vmax, 50), vmin=vmin, vmax=vmax)
-    ax.set_title(f't={n*dt:.2f}s', fontsize=8)
-    ax.set_xlabel('x', fontsize=8)
-    ax.set_ylabel('y', fontsize=8)
-    ax.tick_params(axis='both', which='major', labelsize=6)
-
-# Add a single color bar for all subplots
-cbar = fig.colorbar(contour, ax=axes, orientation='horizontal', fraction=0.05, pad=0.1, ticks=colorbar_ticks)
-cbar.ax.set_xticklabels([str(tick) for tick in colorbar_ticks])
+im = ax.imshow(u[0, :, :].T, cmap='hot', vmin=vmin, vmax=vmax, origin='lower',
+               extent=[0, Lx, 0, Ly], aspect='auto')
+cbar = fig.colorbar(im, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
 cbar.set_label('Temperature (deg C)', fontsize=10)
+ax.set_xlabel('x (mm)')
+ax.set_ylabel('y (mm)')
+ax.set_title('Temperature Distribution (Animated)')
 
-plt.suptitle('Temperature Distribution Over Time', fontsize=12)
+def animate(frame):
+    im.set_data(u[frame, :, :].T)
+    ax.set_title(f'Temperature Distribution\nt={frame*dt:.2f}s')
+    return [im]
+
+frame_interval = 10
+frames = range(0, Nt, frame_interval)
+
+ani = animation.FuncAnimation(fig, animate, frames=frames, blit=False, interval=50)
+
 plt.show()
