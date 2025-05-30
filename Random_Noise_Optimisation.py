@@ -166,7 +166,7 @@ class HeatTransferModel:
             lap = self._laplacian(T)
             T_diff = T + self.dt * alpha * lap 
             #print("thickness", self.thickness)
-            source_increment = S_total / (self.dx * self.dy * self.thickness * self.material['rho'] * self.material['cp'])
+            source_increment = self.dt * S_total / (self.dx * self.dy * self.thickness * self.material['rho'] * self.material['cp'])
             #print("max source_increment", anp.max(source_increment))
             # Update temperature field
             T_new = T_diff + source_increment
@@ -219,8 +219,9 @@ class TrajectoryOptimizer:
         self.initial_params = initial_params
         self.bounds = bounds
         self.x_range = x_range
-        self.param_names = list(initial_params.keys()) if initial_params else None
-        
+        # Only include optimizable parameters (exclude Q, r0, v)
+        self.param_names = [k for k in initial_params.keys() if k not in ['Q', 'r0', 'sawtooth_v', 'swirl_v']]
+
     def parameters_to_array(self, params_dict):
         """Convert dictionary of parameters to flat array for optimizer."""
         return anp.array([params_dict[name] for name in self.param_names])
@@ -235,32 +236,29 @@ class TrajectoryOptimizer:
         Returns tuple of (laser_params, heat_params).
         """
         params_dict = self.array_to_parameters(params_array)
-        
-        # Unpack laser path parameters for sawtooth and swirl trajectories
+
+        # Use fixed values for non-optimized parameters
+        # Set fixed values for v, Q, r0
         sawtooth_params = {
-            'v': params_dict['sawtooth_v'],
+            'v': 0.05,  # fixed speed
             'A': params_dict['sawtooth_A'],
             'y0': params_dict['sawtooth_y0'],
             'period': params_dict['sawtooth_period']
         }
-        
+
         swirl_params = {
-            'v': params_dict['swirl_v'],
+            'v': 0.05,  # fixed speed
             'A': params_dict['swirl_A'],
             'y0': params_dict['swirl_y0'],
             'fr': params_dict['swirl_fr']
         }
-        
-        # Heat params can use either Goldak or Gaussian model
-        # If r0 is provided, add it to heat_params
-        heat_param_keys = ['Q', 'r0'] if 'r0' in params_dict else ['Q', 'a_f', 'a_b', 'b_param', 'f_f', 'f_b']
-        
-        # Create heat parameters for both lasers (usually identical)
+
+        # Use fixed heat parameters
         heat_params = (
-            {key: params_dict[key] for key in heat_param_keys if key in params_dict},
-            {key: params_dict[key] for key in heat_param_keys if key in params_dict}
+            {'Q': 300.0, 'r0': 5e-5},
+            {'Q': 300.0, 'r0': 5e-5}
         )
-        
+
         laser_params = (sawtooth_params, swirl_params)
         return laser_params, heat_params
     
@@ -784,14 +782,14 @@ class Visualization:
         T_init = self.model.simulate((laser_init, heat_init), use_gaussian=use_gaussian)
         T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian)
 
-        # Compute temperature gradients
-        _, _, grad_init = self.model.compute_temperature_gradients(T_init)
-        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
-
-        # Identify melt pools
+        # Add these lines to define melt pool masks
         melt_temp = self.model.material.get('T_melt', self.model.material['T0'] + 100)
         melt_mask_init = T_init > melt_temp
         melt_mask_opt = T_opt > melt_temp
+
+        # Determine the global min and max for the color scale
+        T_min = min(np.min(T_init), np.min(T_opt))
+        T_max = max(np.max(T_init), np.max(T_opt))
 
         # Create a better temperature colormap
         colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
@@ -807,7 +805,7 @@ class Visualization:
         ax3 = fig.add_subplot(gs[0, 2])  # Path comparison
         ax4 = fig.add_subplot(gs[1, 0])  # Initial gradient
         ax5 = fig.add_subplot(gs[1, 1])  # Optimized gradient
-        ax6 = fig.add_subplot(gs[1, 2])  # Melt pool metrics
+        # ax6 = fig.add_subplot(gs[1, 2])  # Melt pool metrics (REMOVED)
         
         # Define the full physical extent for proper rendering
         full_extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]  # [x_min, x_max, y_min, y_max] in mm
@@ -844,12 +842,14 @@ class Visualization:
         x_phys = np.linspace(0, self.model.Lx, self.model.nx) * 1000  # mm
         y_phys = np.linspace(0, self.model.Ly, self.model.ny) * 1000  # mm
         X_phys, Y_phys = np.meshgrid(x_phys, y_phys)
+
+        # Compute gradients for initial and optimized temperature fields
+        _, _, grad_init = self.model.compute_temperature_gradients(T_init)
+        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
         
         # Display temperature field using the full domain for both rendering and extent
         im1 = ax1.imshow(T_init, extent=full_extent, origin='lower', 
                         cmap=cmap_temp, interpolation='bilinear', aspect='auto')
-        cs1 = ax1.contour(X_phys, Y_phys, T_init, levels=[melt_temp], 
-                        colors='cyan', linewidths=2)
         
         # Plot laser paths on temperature field with increased visibility
         ax1.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'w-', linewidth=2.5, alpha=0.9)
@@ -862,13 +862,13 @@ class Visualization:
         # Add metrics text
         melt_count_init = np.sum(melt_mask_init)
         max_temp_init = np.max(T_init)
-        
+
         if melt_count_init > 0:
             T_melt_init = T_init[melt_mask_init]
             cv_init = np.std(T_melt_init) / np.mean(T_melt_init) * 100
             metrics_text = f"Max Temp: {max_temp_init:.0f}°C\nMelt Pool: {melt_count_init} pts\nCV: {cv_init:.1f}%"
         else:
-            metrics_text = f"Max Temp: {max_temp_init:.0f}°C\nNo melt pool"
+            metrics_text = f"Max Temp: {max_temp_init:.0f}°C"
         
         text_box = ax1.text(0.05, 0.95, metrics_text, transform=ax1.transAxes, fontsize=10,
                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='black', 
@@ -886,8 +886,6 @@ class Visualization:
         # Plot optimized temperature field
         im2 = ax2.imshow(T_opt, extent=full_extent, origin='lower', 
                         cmap=cmap_temp, interpolation='bilinear', aspect='auto')
-        cs2 = ax2.contour(X_phys, Y_phys, T_opt, levels=[melt_temp], 
-                        colors='cyan', linewidths=2)
         
         # Plot laser paths on temperature field with increased visibility
         ax2.plot(opt_saw_path_mm[:, 0], opt_saw_path_mm[:, 1], 'w-', linewidth=2.5, alpha=0.9)
@@ -900,13 +898,13 @@ class Visualization:
         # Add metrics text
         melt_count_opt = np.sum(melt_mask_opt)
         max_temp_opt = np.max(T_opt)
-        
+
         if melt_count_opt > 0:
             T_melt_opt = T_opt[melt_mask_opt]
             cv_opt = np.std(T_melt_opt) / np.mean(T_melt_opt) * 100
             metrics_text = f"Max Temp: {max_temp_opt:.0f}°C\nMelt Pool: {melt_count_opt} pts\nCV: {cv_opt:.1f}%"
         else:
-            metrics_text = f"Max Temp: {max_temp_opt:.0f}°C\nNo melt pool"
+            metrics_text = f"Max Temp: {max_temp_opt:.0f}°C"
         
         text_box = ax2.text(0.05, 0.95, metrics_text, transform=ax2.transAxes, fontsize=10,
                         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='black', 
@@ -944,8 +942,6 @@ class Visualization:
         # Plot gradient fields
         im4 = ax4.imshow(grad_init/1000, extent=full_extent, origin='lower', 
                         cmap='viridis', interpolation='bilinear', aspect='auto')
-        ax4.contour(X_phys, Y_phys, T_init, levels=[melt_temp], 
-                colors='cyan', linewidths=2)
         
         # Plot paths on gradient field
         ax4.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'w-', linewidth=1.5, alpha=0.7)
@@ -961,8 +957,6 @@ class Visualization:
         # Plot optimized gradient field
         im5 = ax5.imshow(grad_opt/1000, extent=full_extent, origin='lower', 
                         cmap='viridis', interpolation='bilinear', aspect='auto')
-        ax5.contour(X_phys, Y_phys, T_opt, levels=[melt_temp], 
-                colors='cyan', linewidths=2)
         
         # Plot paths on gradient field
         ax5.plot(opt_saw_path_mm[:, 0], opt_saw_path_mm[:, 1], 'w-', linewidth=1.5, alpha=0.7)
@@ -974,53 +968,6 @@ class Visualization:
         ax5.set_xlim(x_min, x_max)
         ax5.set_ylim(y_min, y_max)
         fig.colorbar(im5, ax=ax5, label='Gradient (°C/mm)')
-        
-        # Calculate metrics
-        T_melt_init = T_init[melt_mask_init] if np.any(melt_mask_init) else np.array([0])
-        T_melt_opt = T_opt[melt_mask_opt] if np.any(melt_mask_opt) else np.array([0])
-        
-        # Plot temperature distribution histogram
-        ax6.hist(T_melt_init, bins=30, alpha=0.5, color='blue', label='Initial')
-        ax6.hist(T_melt_opt, bins=30, alpha=0.5, color='red', label='Optimized')
-        ax6.set_xlabel('Temperature (°C)')
-        ax6.set_ylabel('Count')
-        ax6.set_title('Melt Pool Temperature Distribution')
-        ax6.legend()
-        
-        # Add metrics table
-        metrics = {
-            'Melt Pool Size (points)': [np.sum(melt_mask_init), np.sum(melt_mask_opt)],
-            'Mean Temperature (°C)': [np.mean(T_melt_init), np.mean(T_melt_opt)],
-            'Temp. Std Dev (°C)': [np.std(T_melt_init), np.std(T_melt_opt)],
-            'CV (%)': [np.std(T_melt_init)/np.mean(T_melt_init)*100 if np.mean(T_melt_init) > 0 else 0,
-                    np.std(T_melt_opt)/np.mean(T_melt_opt)*100 if np.mean(T_melt_opt) > 0 else 0],
-            'Max Gradient (°C/mm)': [np.max(grad_init)/1000, np.max(grad_opt)/1000],
-        }
-        
-        # Create table below the histogram instead of in the middle
-        table_ax = fig.add_axes([0.67, -0.15, 0.25, 0.15])
-        table_ax.axis('tight')
-        table_ax.axis('off')
-        table_data = [[metric] + [f"{val:.1f}" if isinstance(val, float) else f"{val}" 
-                            for val in values] for metric, values in metrics.items()]
-        table = table_ax.table(cellText=table_data,
-                            colLabels=['Metric', 'Initial', 'Optimized'],
-                            loc='center', cellLoc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.2, 1.5)
-        
-        # Add a legend for the entire figure (moved to left side to avoid overlapping with table)
-        legend_ax = fig.add_axes([0.05, 0.02, 0.4, 0.02])
-        legend_ax.axis('off')
-        legend_elements = [
-            plt.Line2D([0], [0], color='white', marker='o', markersize=8, markerfacecolor='white',
-                    markeredgecolor='black', label='Sawtooth Laser'),
-            plt.Line2D([0], [0], color='green', marker='o', markersize=8, markerfacecolor='green',
-                    markeredgecolor='black', label='Swirl Laser'),
-            plt.Line2D([0], [0], color='cyan', lw=2, label='Melt Pool Boundary')
-        ]
-        legend_ax.legend(handles=legend_elements, loc='center', ncol=3, frameon=False)
         
         plt.suptitle('LPBF Dual Laser Scan Optimization: Initial vs. Optimized', fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.94])
@@ -1080,6 +1027,19 @@ class Visualization:
         
         initial_laser_params, initial_heat_params = temp_optimizer.unpack_parameters(initial_array)
         optimized_laser_params, optimized_heat_params = temp_optimizer.unpack_parameters(optimized_array)
+        
+        # Run both simulations to get the full temperature range for color scale
+        T_init = model.simulate((initial_laser_params, initial_heat_params), use_gaussian=use_gaussian)
+        T_opt = model.simulate((optimized_laser_params, optimized_heat_params), use_gaussian=use_gaussian)
+
+        # Add these lines to define melt pool masks
+        melt_temp = model.material.get('T_melt', model.material['T0'] + 100)
+        melt_mask_init = T_init > melt_temp
+        melt_mask_opt = T_opt > melt_temp
+
+        # Determine the global min and max for the color scale
+        T_min = min(np.min(T_init), np.min(T_opt))
+        T_max = max(np.max(T_init), np.max(T_opt))
         
         # Define physical coordinate extents
         full_extent = [0, model.Lx * 1000, 0, model.Ly * 1000]  # [x_min, x_max, y_min, y_max] in mm
@@ -1146,11 +1106,11 @@ class Visualization:
         
         # Use the full domain extent for rendering the temperature field
         image_initial = axes[0].imshow(init_field, extent=full_extent, origin='lower', 
-                                    cmap=cmap_temp, vmin=T_min, vmax=initial_T_max,
+                                    cmap=cmap_temp, vmin=T_min, vmax=T_max,
                                     interpolation='bilinear', aspect='auto')
         
         image_optimized = axes[1].imshow(init_field, extent=full_extent, origin='lower', 
-                                    cmap=cmap_temp, vmin=T_min, vmax=initial_T_max,
+                                    cmap=cmap_temp, vmin=T_min, vmax=T_max,
                                     interpolation='bilinear', aspect='auto')
         
         # Add colorbars
@@ -1204,16 +1164,19 @@ class Visualization:
             plt.Line2D([0], [0], color='white', marker='o', markersize=8, markerfacecolor='white',
                     markeredgecolor='black', label='Sawtooth Laser'),
             plt.Line2D([0], [0], color='green', marker='o', markersize=8, markerfacecolor='green',
-                    markeredgecolor='black', label='Swirl Laser'),
-            plt.Line2D([0], [0], color='cyan', lw=2, label='Melt Pool Boundary')
+                    markeredgecolor='black', label='Swirl Laser')
         ]
         fig.legend(handles=legend_elements, loc='lower center', 
-                bbox_to_anchor=(0.5, 0.02), ncol=3, fontsize=12)
+                bbox_to_anchor=(0.5, 0.02), ncol=2, fontsize=12)
         
         # Initialize temperature fields
         T_initial = init_field.copy()
         T_optimized = init_field.copy()
         
+        # Reset temperature fields before animation starts
+        T_initial = np.ones((model.ny, model.nx)) * model.material['T0']
+        T_optimized = np.ones((model.ny, model.nx)) * model.material['T0']
+
         # Store the variable for updating color limits
         T_max = initial_T_max
         
@@ -1323,11 +1286,11 @@ class Visualization:
                     rho = model.material['rho']
                     cp = model.material['cp']
                     
-                    # Apply initial heat sources
-                    T_init_new += (S_init1 + S_init2) * (1 / (model.dx * model.dy * thickness * rho)) * (1 / cp)
+                    # Apply initial heat sources (include dt)
+                    T_init_new += (S_init1 + S_init2) * (model.dt / (model.dx * model.dy * thickness * rho * cp))
                     
-                    # Apply optimized heat sources  
-                    T_opt_new += (S_opt1 + S_opt2) * (1 / (model.dx * model.dy * thickness * rho)) * (1 / cp)
+                    # Apply optimized heat sources (include dt)
+                    T_opt_new += (S_opt1 + S_opt2) * (model.dt / (model.dx * model.dy * thickness * rho * cp))
             else:
                 # For Goldak sources which need tangent vectors
                 if hasattr(model, 'apply_heat_source'):
@@ -1418,18 +1381,20 @@ class Visualization:
             image_initial.set_array(T_initial)
             image_optimized.set_array(T_optimized)
             
-            # Update melt pool contours
-            contour_initial = update_contour(contour_initial, axes[0], T_initial, melt_temp)
-            contour_optimized = update_contour(contour_optimized, axes[1], T_optimized, melt_temp)
+            # Update melt pool contours (remove old, add new)
+            if contour_initial is not None and hasattr(contour_initial, "collections"):
+                for coll in contour_initial.collections:
+                   
+                    coll.remove()
+            if contour_optimized is not None and hasattr(contour_optimized, "collections"):
+                for coll in contour_optimized.collections:
+                    coll.remove()
+            contour_initial = axes[0].contour(X_phys, Y_phys, T_initial, levels=[melt_temp], colors='cyan', linewidths=2)
+            contour_optimized = axes[1].contour(X_phys, Y_phys, T_optimized, levels=[melt_temp], colors='cyan', linewidths=2)
             
-            # Adjust color scales if needed
-            shared_max = max(np.max(T_initial), np.max(T_optimized))
-            if shared_max > T_max:
-                # Cap at reasonable value
-                new_max = min(shared_max, melt_temp * 3)
-                image_initial.set_clim(vmax=new_max)
-                image_optimized.set_clim(vmax=new_max)
-                T_max = new_max
+            # Keep color scale fixed to match static comparison plots
+            image_initial.set_clim(vmin=T_min, vmax=T_max)
+            image_optimized.set_clim(vmin=T_min, vmax=T_max)
             
             return [image_initial, image_optimized,
                     source_marker_initial1, source_marker_initial2,
@@ -1438,6 +1403,24 @@ class Visualization:
                     path_line_optimized1, path_line_optimized2,
                     temp_text_initial, temp_text_optimized]
         
+        # Function to reset temperature fields and visuals at the start of animation
+        def init_animation():
+            nonlocal T_initial, T_optimized, contour_initial, contour_optimized, T_max
+            T_initial = np.ones((model.ny, model.nx)) * model.material['T0']
+            T_optimized = np.ones((model.ny, model.nx)) * model.material['T0']
+            image_initial.set_array(T_initial)
+            image_optimized.set_array(T_optimized)
+            # Remove old contours
+            if contour_initial is not None and hasattr(contour_initial, "collections"):
+                for coll in contour_initial.collections:
+                    coll.remove()
+            if contour_optimized is not None and hasattr(contour_optimized, "collections"):
+                for coll in contour_optimized.collections:
+                    coll.remove()
+            contour_initial = axes[0].contour(X_phys, Y_phys, T_initial, levels=[melt_temp], colors='cyan', linewidths=2)
+            contour_optimized = axes[1].contour(X_phys, Y_phys, T_optimized, levels=[melt_temp], colors='cyan', linewidths=2)
+            return [image_initial, image_optimized, contour_initial, contour_optimized]
+
         # Create animation with fewer frames for smoother performance
         frame_count = len(times)
         
@@ -1450,7 +1433,8 @@ class Visualization:
         
         ani = animation.FuncAnimation(
             fig, update, frames=frames_to_use,
-            interval=1000/fps, blit=True
+            interval=1000/fps, blit=True,
+            init_func=init_animation  # <-- add this line
         )
         
         # Save animation if requested
@@ -1461,6 +1445,7 @@ class Visualization:
         
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.subplots_adjust(bottom=0.1, wspace=0.3)
+       
         plt.show()
         
         return ani
@@ -1472,7 +1457,7 @@ def run_optimization():
         'alpha': 5e-6,             # Thermal diffusivity (m²/s)
         'rho': 7800.0,             # Density (kg/m³)
         'cp': 500.0,               # Specific heat capacity (J/kg·K)
-        'thickness': 0.01,       # Thickness (m) (1mm?)
+        'thickness':  0.01,       # Thickness (m) (1mm?)
         'T_melt': 1500.0,          # Melting temperature (°C)
         'k': 20.0,                 # Thermal conductivity (W/m·K)
         'absorptivity': 1,       # Laser absorptivity
@@ -1498,41 +1483,47 @@ def run_optimization():
         'sawtooth_A': 0.001,        # 1mm amplitude 
         'sawtooth_y0': 0.0025,       # Center position (3mm)
         'sawtooth_period': 0.02,    # 20ms period
-        
+
         # Swirl/Spiral path parameters
         'swirl_v': 0.05,            # 50 mm/s scan speed
         'swirl_A': 0.001,           # 1mm amplitude
         'swirl_y0': 0.0025,          # Center position (7mm)
         'swirl_fr': 10.0,           # 10 Hz frequency
-        
-        # Laser parameters for Gaussian model
-        'Q': 300.0,                 # 300W laser power
-        'r0': 5e-5,                 # 50μm beam radius
+
+        # Laser parameters for Gaussian model (fixed, not optimized)
+        # 'Q': 300.0,                 # 300W laser power
+        # 'r0': 5e-5,                 # 50μm beam radius
     }
-    
+
     # 5. Define parameter bounds
     bounds = {
-        # Velocity bounds (m/s)
-        'sawtooth_v': (0.0001, 0.1),
-        'swirl_v': (0.0001, 0.1),
-        
+        # Velocity bounds (m/s) -- REMOVE from optimizable parameters
+        # 'sawtooth_v': (0.0001, 0.1),
+        # 'swirl_v': (0.0001, 0.1),
+
         # Amplitude bounds (m)
         'sawtooth_A': (0.00005, 0.002),
         'swirl_A': (0.00005, 0.002),
-        
+
         # Position bounds (m)
         'sawtooth_y0': (0.001, 0.003),
         'swirl_y0': (0.001, 0.003),
-        
+
         # Time parameter bounds
         'sawtooth_period': (0.01, 0.05),
         'swirl_fr': (5.0, 20.0),
-        
-        # Laser parameter bounds
-        'Q': (50.0, 500.0),
-        'r0': (3e-5, 8e-5),
+
+        # Laser parameter bounds (REMOVE from optimizable parameters)
+        # 'Q': (50.0, 500.0),
+        # 'r0': (3e-5, 8e-5),
     }
-    
+
+    # Set fixed laser parameters for simulation
+    fixed_heat_params = [
+        {'Q': 300.0, 'r0': 5e-5},  # Sawtooth laser
+        {'Q': 300.0, 'r0': 5e-5},  # Swirl laser
+    ]
+
     # 6. Create trajectory optimizer
     optimizer = TrajectoryOptimizer(
         model=model,
@@ -1547,9 +1538,19 @@ def run_optimization():
     print("=============================================\n")
     
     # Choose method and objective
-    method = 'Powell'  # Options: 'SLSQP', 'L-BFGS-B', 'Nelder-Mead', 'Powell', 'COBYLA'
+    method = 'Powell'  # Options: 'SLSQP', 'L-BFGS-B', 'Nelder-Mead', 'Powell'
     objective = 'standard'  # Options: 'standard', 'thermal_uniformity', 'max_gradient', etc.
-    
+
+    # Add a line describing what is being optimized for
+    objective_descriptions = {
+        'standard': "Minimizing the sum of squared temperature gradients (smoothness of temperature field).",
+        'thermal_uniformity': "Promoting thermal uniformity (variance in melt pool temperature and gradients).",
+        'max_gradient': "Minimizing the maximum temperature gradient (reducing hot spots).",
+        'path_focused': "Minimizing gradients along the laser paths (melt pool quality along scan).",
+        'max_temp_difference': "Minimizing the maximum temperature difference in the melt pool."
+    }
+    print(f"Optimization objective: {objective_descriptions.get(objective, 'Unknown objective')}")
+
     # Run the optimization
     try:
         result, optimized_params = optimizer.optimize(
@@ -1622,7 +1623,8 @@ def run_optimization():
             )
             
         # Optional: Perform sensitivity analysis
-        run_sensitivity = input("Perform sensitivity analysis of optimized solution? (y/n): ").lower()
+        run_sensitivity = input("Perform sensitivity analysis of optimized solution? (y/n): ")
+
         if run_sensitivity == 'y':
             print("\nPerforming sensitivity analysis...")
             sensitivity_data = optimizer.perform_sensitivity_analysis(
