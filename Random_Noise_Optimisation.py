@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 from autograd import grad, jacobian, hessian
 import autograd.numpy as anp 
 import cvxpy as cp
+import os
 
 # ===============================
 # 1. Heat Transfer Model Class
@@ -24,7 +25,6 @@ class HeatTransferModel:
         self.nt = None  # will be set in simulate()
         self.debug_counter = 0  # For diagnostic output
         
-        # Default material parameters for LPBF simulation (all in SI units)
         default_params = {
             'T0': 20.0,           # Initial temperature (°C)
             'alpha': 5e-6,        # Thermal diffusivity (m²/s)
@@ -1280,6 +1280,26 @@ class Visualization:
             fig, update, frames=frames_to_use,
             interval=1000/fps, blit=False  # <--- set blit to False
         )
+        
+        # --- Save frames at every 0.01s of simulated time ---
+        import os
+        save_frames = True  # Set to True to enable saving
+        frame_folder = os.path.join(os.getcwd(), "animation_frames")
+        if save_frames:
+            os.makedirs(frame_folder, exist_ok=True)
+            saved_times = set()
+            save_interval = 0.01  # seconds
+            next_save_time = 0.0
+            for idx, frame in enumerate(frames_to_use):
+                t = times[frame]
+                # Save frame if we've reached or passed the next interval
+                if t >= next_save_time - 1e-6:
+                    update(frame)  # Update the figure to this frame
+                    fname = os.path.join(frame_folder, f"frame_{t:.3f}s.png")
+                    plt.savefig(fname, dpi=150)
+                    saved_times.add(round(t, 3))
+                    next_save_time += save_interval
+            print(f"Saved frames at times (s): {sorted(saved_times)}")
         
         # Save animation if requested
         if save_gif:
