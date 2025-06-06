@@ -782,9 +782,9 @@ class Visualization:
         T_init = self.model.simulate((laser_init, heat_init), use_gaussian=use_gaussian)
         T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian)
 
-        # Set the color scale bar for the animation to fixed limits (0°C to 300°C)
+        # Set the color scale bar for the animation to the highest temperature seen during the simulation
         T_min = 0
-        T_max = 300
+        T_max = max(np.max(T_init), np.max(T_opt))
 
         # Create a better temperature colormap
         colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
@@ -1030,10 +1030,10 @@ class Visualization:
         T_init = model.simulate((initial_laser_params, initial_heat_params), use_gaussian=use_gaussian)
         T_opt = model.simulate((optimized_laser_params, optimized_heat_params), use_gaussian=use_gaussian)
 
-        # Set the color scale bar for the animation to fixed limits (0°C to 300°C)
+        # Set the color scale bar for the animation to the highest temperature seen during the simulation
         T_min = 0
-        T_max = 300
-        
+        T_max = max(np.max(T_init), np.max(T_opt))
+
         # Define physical coordinate extents
         full_extent = [0, model.Lx * 1000, 0, model.Ly * 1000]  # [x_min, x_max, y_min, y_max] in mm
         
