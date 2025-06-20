@@ -57,16 +57,22 @@ class HeatTransferModel:
         return lap
 
     def sawtooth_trajectory(self, t, params):
-        # added stuff to make differentiable if needed
         v = params['v']
         A = params['A']
         y0 = params['y0']
         period = params['period']
+        noise_amplitude = params.get('noise_amplitude', 0.0)
+        # Clamp noise amplitude to a maximum value (e.g., 0.2 mm)
+        max_noise = 0.0002  # 0.2 mm
+        noise_amplitude = anp.clip(noise_amplitude, 0.0, max_noise)
         
         raw_x = v * t
         k = 1000  # sharpness parameter
         x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
         y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(2 * anp.pi * t / period))
+        if noise_amplitude > 0:
+            x = x + noise_amplitude * anp.random.randn()
+            y = y + noise_amplitude * anp.random.randn()
         tx = v
         ty = (2 * A / period) * anp.cos(2 * anp.pi * t / period)
         norm = anp.sqrt(tx**2 + ty**2)
@@ -78,11 +84,18 @@ class HeatTransferModel:
         y0 = params['y0']
         fr = params['fr']
         om = 2 * anp.pi * fr
+        noise_amplitude = params.get('noise_amplitude', 0.0)
+        # Clamp noise amplitude to a maximum value (e.g., 0.1 mm)
+        max_noise = 0.0001  # 0.1 mm
+        noise_amplitude = anp.clip(noise_amplitude, 0.0, max_noise)
         
         raw_x = v * t + A * anp.sin(om * t)
         k = 1000
         x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
         y = y0 + A * anp.cos(om * t)
+        if noise_amplitude > 0:
+            x = x + noise_amplitude * anp.random.randn()
+            y = y + noise_amplitude * anp.random.randn()
         tx = v + A * om * anp.cos(om * t)
         ty = -A * om * anp.sin(om * t)
         norm = anp.sqrt(tx**2 + ty**2)
@@ -219,46 +232,37 @@ class TrajectoryOptimizer:
         self.initial_params = initial_params
         self.bounds = bounds
         self.x_range = x_range
-        # Only include optimizable parameters (exclude Q, r0, v, y0)
-        self.param_names = [k for k in initial_params.keys() if k not in ['Q', 'r0', 'sawtooth_v', 'swirl_v', 'sawtooth_y0', 'swirl_y0']]
+        # Only optimize noise_amplitude
+        self.param_names = ['noise_amplitude']
 
     def parameters_to_array(self, params_dict):
-        """Convert dictionary of parameters to flat array for optimizer."""
         return anp.array([params_dict[name] for name in self.param_names])
     
     def array_to_parameters(self, params_array):
-        """Convert flat array from optimizer to dictionary of parameters."""
         return {name: params_array[i] for i, name in enumerate(self.param_names)}
     
     def unpack_parameters(self, params_array):
-        """
-        Unpack flat parameter array into structured format for model simulation.
-        Returns tuple of (laser_params, heat_params).
-        """
         params_dict = self.array_to_parameters(params_array)
-
-        # Use fixed values for non-optimized parameters
-        # Set fixed values for v, Q, r0, y0
+        noise_amplitude = params_dict['noise_amplitude']
+        # All other parameters fixed
         sawtooth_params = {
-            'v': 0.05,  # fixed speed
-            'A': params_dict['sawtooth_A'],
-            'y0': self.initial_params['sawtooth_y0'],  # fixed y0
-            'period': params_dict['sawtooth_period']
+            'v': self.initial_params['sawtooth_v'],
+            'A': self.initial_params['sawtooth_A'],
+            'y0': self.initial_params['sawtooth_y0'],
+            'period': self.initial_params['sawtooth_period'],
+            'noise_amplitude': noise_amplitude
         }
-
         swirl_params = {
-            'v': 0.05,  # fixed speed
-            'A': params_dict['swirl_A'],
-            'y0': self.initial_params['swirl_y0'],  # fixed y0
-            'fr': params_dict['swirl_fr']
+            'v': self.initial_params['swirl_v'],
+            'A': self.initial_params['swirl_A'],
+            'y0': self.initial_params['swirl_y0'],
+            'fr': self.initial_params['swirl_fr'],
+            'noise_amplitude': noise_amplitude
         }
-
-        # Use fixed heat parameters
         heat_params = (
             {'Q': 300.0, 'r0': 5e-5},
             {'Q': 300.0, 'r0': 5e-5}
         )
-
         laser_params = (sawtooth_params, swirl_params)
         return laser_params, heat_params
     
@@ -1342,44 +1346,20 @@ def run_optimization():
     
     # 4. Define initial parameters
     initial_params = {
-        # Sawtooth path parameters
-        'sawtooth_v': 0.05,         # 50 mm/s scan speed
-        'sawtooth_A': 0.001,        # 1mm amplitude 
-        'sawtooth_y0': 0.0025,       # Center position (3mm) -- now fixed
-        'sawtooth_period': 0.02,    # 20ms period
-
-        # Swirl/Spiral path parameters
-        'swirl_v': 0.05,            # 50 mm/s scan speed
-        'swirl_A': 0.001,           # 1mm amplitude
-        'swirl_y0': 0.0025,          # Center position (7mm) -- now fixed
-        'swirl_fr': 10.0,           # 10 Hz frequency
-
-        # Laser parameters for Gaussian model (fixed, not optimized)
-        # 'Q': 300.0,                 # 300W laser power
-        # 'r0': 5e-5,                 # 50μm beam radius
+        'sawtooth_v': 0.05,
+        'sawtooth_A': 0.001,
+        'sawtooth_y0': 0.0025,
+        'sawtooth_period': 0.02,
+        'swirl_v': 0.05,
+        'swirl_A': 0.001,
+        'swirl_y0': 0.0025,
+        'swirl_fr': 10.0,
+        'noise_amplitude': 0.0  # Start with no noise
     }
 
     # 5. Define parameter bounds
     bounds = {
-        # Velocity bounds (m/s) -- REMOVE from optimizable parameters
-        # 'sawtooth_v': (0.0001, 0.1),
-        # 'swirl_v': (0.0001, 0.1),
-
-        # Amplitude bounds (m)
-        'sawtooth_A': (0.00005, 0.002),
-        'swirl_A': (0.00005, 0.002),
-
-        # Position bounds (m) -- REMOVE y0 from bounds
-        # 'sawtooth_y0': (0.001, 0.003),
-        # 'swirl_y0': (0.001, 0.003),
-
-        # Time parameter bounds
-        'sawtooth_period': (0.01, 0.05),
-        'swirl_fr': (5.0, 20.0),
-
-        # Laser parameter bounds (REMOVE from optimizable parameters)
-        # 'Q': (50.0, 500.0),
-        # 'r0': (3e-5, 8e-5),
+        'noise_amplitude': (0.0, 0.001)  # Limit to 1 mm
     }
 
     # Set fixed laser parameters for simulation
