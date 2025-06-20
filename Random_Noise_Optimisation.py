@@ -970,6 +970,14 @@ class Visualization:
         plt.suptitle('LPBF Dual Laser Scan Optimization: Initial vs. Optimized', fontsize=16)
         plt.tight_layout(rect=[0, 0, 1, 0.94])
         plt.subplots_adjust(bottom=0.1, wspace=0.25, hspace=0.3)  # Adjust spacing
+
+        # Add a label below the figure to explain the scan path colors (matching the animation)
+        fig.text(
+            0.5, 0.01,
+            "White line: Sawtooth scan path    |    Green line: Swirl scan path",
+            ha='center', va='bottom', fontsize=11, color='black'
+        )
+
         plt.show()
         
         return fig
