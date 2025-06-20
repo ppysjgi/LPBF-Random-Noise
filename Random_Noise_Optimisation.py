@@ -1169,7 +1169,7 @@ class Visualization:
             t = times[frame]
 
             # Update the time title
-            time_title.set_text(f'Simulation Time: {t:.3f} s (Step {frame+1}/{len(frames_to_use)})')
+            time_title.set_text(f'Simulation Time: {t:.3f} s (Step {frame+1}/{len(times)})')
 
             # Get current laser source positions
             x_src_init1, y_src_init1 = initial_path1[frame]
