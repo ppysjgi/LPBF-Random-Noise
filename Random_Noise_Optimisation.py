@@ -26,13 +26,13 @@ class HeatTransferModel:
         self.debug_counter = 0  # For diagnostic output
         
         default_params = {
-            'T0': 20.0,           # Initial temperature (°C)
+            'T0': 21.0,           # Initial temperature (°C)
             'alpha': 5e-6,        # Thermal diffusivity (m²/s)
             'rho': 7800.0,        # Density (kg/m³)
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K)
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.1    # Plate thickness (m)
+            'thickness': 0.00017  # Plate thickness (m)
         }
         self.material = default_params if material_params is None else material_params
         self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
@@ -57,18 +57,27 @@ class HeatTransferModel:
         return lap
 
     def sawtooth_trajectory(self, t, params):
-        # added stuff to make differentiable if needed
         v = params['v']
         A = params['A']
         y0 = params['y0']
         period = params['period']
-        
-        raw_x = v * t
+        noise_sigma = params.get('noise_sigma', 0.0)
+        max_noise = 0.00005  # 0.05 mm
+        noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
+        omega = 2 * anp.pi / period
+        # Average speed factor for sawtooth (approximate)
+        avg_speed_factor = anp.sqrt(1 + (2 * A * omega / anp.pi) ** 2)
+        t_scaled = t * avg_speed_factor
+        raw_x = v * t_scaled
         k = 1000  # sharpness parameter
         x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
-        y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(2 * anp.pi * t / period))
+        y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(omega * t_scaled))
+        if noise_sigma > 0:
+            import numpy as np
+            x = x + noise_sigma * np.random.randn()
+            y = y + noise_sigma * np.random.randn()
         tx = v
-        ty = (2 * A / period) * anp.cos(2 * anp.pi * t / period)
+        ty = (2 * A * omega / anp.pi) * anp.cos(omega * t_scaled)
         norm = anp.sqrt(tx**2 + ty**2)
         return x, y, tx / norm, ty / norm
 
@@ -78,13 +87,22 @@ class HeatTransferModel:
         y0 = params['y0']
         fr = params['fr']
         om = 2 * anp.pi * fr
-        
-        raw_x = v * t + A * anp.sin(om * t)
+        noise_sigma = params.get('noise_sigma', 0.0)
+        max_noise = 0.00005  # 0.05 mm
+        noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
+        # Average speed factor for swirl (circle/ellipse): sqrt(1 + (A*om/v)^2)
+        avg_speed_factor = anp.sqrt(1 + (A * om / v) ** 2)
+        t_scaled = t * avg_speed_factor
+        raw_x = v * t_scaled + A * anp.sin(om * t_scaled)
         k = 1000
         x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
-        y = y0 + A * anp.cos(om * t)
-        tx = v + A * om * anp.cos(om * t)
-        ty = -A * om * anp.sin(om * t)
+        y = y0 + A * anp.cos(om * t_scaled)
+        if noise_sigma > 0:
+            import numpy as np
+            x = x + noise_sigma * np.random.randn()
+            y = y + noise_sigma * np.random.randn()
+        tx = v + A * om * anp.cos(om * t_scaled)
+        ty = -A * om * anp.sin(om * t_scaled)
         norm = anp.sqrt(tx**2 + ty**2)
         return x, y, tx / norm, ty / norm
 
@@ -108,7 +126,7 @@ class HeatTransferModel:
 
     def _gaussian_source(self, x_src, y_src, heat_params):
 
-        power = heat_params.get('Q', 300.0)  # Power in Watts
+        power = heat_params.get('Q', 200.0)  # Power in Watts
         
         # Use r0 if provided, otherwise use sigma_x/sigma_y
         if 'r0' in heat_params:
@@ -137,7 +155,7 @@ class HeatTransferModel:
         if end_x is None:
             end_x = self.Lx
 
-        fixed_nt = 500
+        fixed_nt = 3000  # Increased from 500 to 3000 time steps
         self.nt = fixed_nt
 
         # Use either the provided thermal diffusivity or compute it from k if needed
@@ -214,13 +232,16 @@ class HeatTransferModel:
     
 class TrajectoryOptimizer:
     def __init__(self, model, initial_params=None, bounds=None, x_range=(0.0, 0.01)):
-
         self.model = model
         self.initial_params = initial_params
         self.bounds = bounds
         self.x_range = x_range
-        # Only include optimizable parameters (exclude Q, r0, v, y0)
-        self.param_names = [k for k in initial_params.keys() if k not in ['Q', 'r0', 'sawtooth_v', 'swirl_v', 'sawtooth_y0', 'swirl_y0']]
+        # Now allow Q, r0, v, and noise_sigma to be optimized (exclude only y0)
+        # Add noise_sigma as an optimizable parameter if present in bounds, or always include it
+        self.param_names = [k for k in initial_params.keys() if k not in ['sawtooth_y0', 'swirl_y0']]
+        # Always include noise_sigma if present in bounds, even if not in initial_params
+        if self.bounds and 'noise_sigma' in self.bounds and 'noise_sigma' not in self.param_names:
+            self.param_names.append('noise_sigma')
 
     def parameters_to_array(self, params_dict):
         """Convert dictionary of parameters to flat array for optimizer."""
@@ -237,26 +258,28 @@ class TrajectoryOptimizer:
         """
         params_dict = self.array_to_parameters(params_array)
 
-        # Use fixed values for non-optimized parameters
-        # Set fixed values for v, Q, r0, y0
+        # Use optimized values for v, Q, r0, and noise_sigma
+        noise_sigma = params_dict.get('noise_sigma', self.initial_params.get('noise_sigma', 0.0))
         sawtooth_params = {
-            'v': 0.05,  # fixed speed
+            'v': params_dict['sawtooth_v'],
             'A': params_dict['sawtooth_A'],
-            'y0': self.initial_params['sawtooth_y0'],  # fixed y0
-            'period': params_dict['sawtooth_period']
+            'y0': self.initial_params['sawtooth_y0'],  # y0 still fixed
+            'period': params_dict['sawtooth_period'],
+            'noise_sigma': noise_sigma
         }
 
         swirl_params = {
-            'v': 0.05,  # fixed speed
+            'v': params_dict['swirl_v'],
             'A': params_dict['swirl_A'],
-            'y0': self.initial_params['swirl_y0'],  # fixed y0
-            'fr': params_dict['swirl_fr']
+            'y0': self.initial_params['swirl_y0'],      # y0 still fixed
+            'fr': params_dict['swirl_fr'],
+            'noise_sigma': noise_sigma
         }
 
-        # Use fixed heat parameters
+        # Use optimized Q and r0 for each laser
         heat_params = (
-            {'Q': 300.0, 'r0': 5e-5},
-            {'Q': 300.0, 'r0': 5e-5}
+            {'Q': params_dict['sawtooth_Q'], 'r0': params_dict['sawtooth_r0']},
+            {'Q': params_dict['swirl_Q'], 'r0': params_dict['swirl_r0']}
         )
 
         laser_params = (sawtooth_params, swirl_params)
@@ -778,6 +801,11 @@ class Visualization:
         laser_init, heat_init = temp_optimizer.unpack_parameters(initial_array)
         laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
 
+        v_init1 = laser_init[0]['v']
+        v_init2 = laser_init[1]['v']
+        v_opt1 = laser_opt[0]['v']
+        v_opt2 = laser_opt[1]['v']
+
         # Run simulations
         T_init = self.model.simulate((laser_init, heat_init), use_gaussian=use_gaussian)
         T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian)
@@ -817,15 +845,41 @@ class Visualization:
                 y_crop = (0.002, 0.008)  # default crop in meters
             y_min, y_max = y_crop[0] * 1000, y_crop[1] * 1000  # mm
         
-        # Generate path data
-        path_duration = 0.05
-        t_points = np.linspace(0, path_duration, 300)
-        
-        # Calculate paths (in physical coordinates)
-        init_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_init[0])[:2] for t in t_points])
-        init_swirl_path = np.array([self.model.swirl_trajectory(t, laser_init[1])[:2] for t in t_points])
-        opt_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_opt[0])[:2] for t in t_points])
-        opt_swirl_path = np.array([self.model.swirl_trajectory(t, laser_opt[1])[:2] for t in t_points])
+
+        # --- Arc-length-based resampling for physically accurate path visualization ---
+        def resample_path(path, v, dt):
+            diffs = np.diff(path, axis=0)
+            seg_lengths = np.linalg.norm(diffs, axis=1)
+            arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
+            total_length = arc_length[-1]
+            n_points = int(np.ceil(total_length / (v * dt)))
+            if n_points < 2:
+                n_points = 2
+            target_lengths = np.linspace(0, total_length, n_points)
+            x = np.interp(target_lengths, arc_length, path[:, 0])
+            y = np.interp(target_lengths, arc_length, path[:, 1])
+            return np.stack([x, y], axis=1)
+
+        # Use fine time step for noisy path
+        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
+        sim_duration = self.model.nt * dt  # Actual simulation duration
+
+        t_points_init1 = np.arange(0, sim_duration, dt)
+        t_points_init2 = np.arange(0, sim_duration, dt)
+        t_points_opt1 = np.arange(0, sim_duration, dt)
+        t_points_opt2 = np.arange(0, sim_duration, dt)
+
+        # Generate noisy paths
+        init_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_init[0])[:2] for t in t_points_init1])
+        init_swirl_path = np.array([self.model.swirl_trajectory(t, laser_init[1])[:2] for t in t_points_init2])
+        opt_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_opt[0])[:2] for t in t_points_opt1])
+        opt_swirl_path = np.array([self.model.swirl_trajectory(t, laser_opt[1])[:2] for t in t_points_opt2])
+
+        # Resample at constant arc length intervals
+        init_saw_path = resample_path(init_saw_path, v_init1, dt)
+        init_swirl_path = resample_path(init_swirl_path, v_init2, dt)
+        opt_saw_path = resample_path(opt_saw_path, v_opt1, dt)
+        opt_swirl_path = resample_path(opt_swirl_path, v_opt2, dt)
         
         # Convert to mm
         init_saw_path_mm = init_saw_path * 1000
@@ -849,10 +903,13 @@ class Visualization:
         # Plot laser paths on temperature field with increased visibility
         ax1.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'w-', linewidth=2.5, alpha=0.9)
         ax1.plot(init_swirl_path_mm[:, 0], init_swirl_path_mm[:, 1], 'g-', linewidth=2.5, alpha=0.9)
-        
+
+
         # Add markers for current positions with increased visibility
         ax1.plot(init_saw_path_mm[-1, 0], init_saw_path_mm[-1, 1], 'wo', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
         ax1.plot(init_swirl_path_mm[-1, 0], init_swirl_path_mm[-1, 1], 'go', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
+        # Add legend for the 15mm marker
+        ax1.legend(loc='upper right', fontsize=9, frameon=True)
         
         # Add metrics text
         melt_temp = self.model.material.get('T_melt', self.model.material['T0'] + 100)
@@ -1033,10 +1090,15 @@ class Visualization:
 
         initial_laser_params, initial_heat_params = temp_optimizer.unpack_parameters(initial_array)
         optimized_laser_params, optimized_heat_params = temp_optimizer.unpack_parameters(optimized_array)
-        
-        # Run both simulations to get the full temperature range for color scale
-        T_init = model.simulate((initial_laser_params, initial_heat_params), use_gaussian=use_gaussian)
-        T_opt = model.simulate((optimized_laser_params, optimized_heat_params), use_gaussian=use_gaussian)
+
+        v_init1 = initial_laser_params[0]['v']
+        v_init2 = initial_laser_params[1]['v']
+        v_opt1 = optimized_laser_params[0]['v']
+        v_opt2 = optimized_laser_params[1]['v']
+
+        # Run simulations
+        T_init = self.model.simulate((initial_laser_params, initial_heat_params), use_gaussian=use_gaussian)
+        T_opt = self.model.simulate((optimized_laser_params, optimized_heat_params), use_gaussian=use_gaussian)
 
         # Set the color scale bar for the animation to the highest temperature seen during the simulation
         T_min = 0
@@ -1057,24 +1119,42 @@ class Visualization:
                 y_crop = (0.002, 0.008)  # default crop in meters
             y_min, y_max = y_crop[0] * 1000, y_crop[1] * 1000  # mm
         
-        # Generate trajectory points for longer simulation time
-        # Use either the model's time steps or a custom duration (whichever is longer)
-        model_time = model.nt * model.dt
-        max_time = max(model_time, simulation_duration)
-        num_steps = int(max_time / model.dt)
-        times = np.linspace(0, max_time, num_steps)
-        
-        # Generate all paths
-        initial_path1 = np.array([model.sawtooth_trajectory(t, initial_laser_params[0])[:2] 
-                                for t in times])
-        initial_path2 = np.array([model.swirl_trajectory(t, initial_laser_params[1])[:2] 
-                                for t in times])
-        
-        optimized_path1 = np.array([model.sawtooth_trajectory(t, optimized_laser_params[0])[:2] 
-                                for t in times])
-        optimized_path2 = np.array([model.swirl_trajectory(t, optimized_laser_params[1])[:2] 
-                                for t in times])
-        
+
+        # --- Arc-length-based resampling for physically accurate animation ---
+        def resample_path(path, v, dt):
+            diffs = np.diff(path, axis=0)
+            seg_lengths = np.linalg.norm(diffs, axis=1)
+            arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
+            total_length = arc_length[-1]
+            n_points = int(np.ceil(total_length / (v * dt)))
+            if n_points < 2:
+                n_points = 2
+            target_lengths = np.linspace(0, total_length, n_points)
+            x = np.interp(target_lengths, arc_length, path[:, 0])
+            y = np.interp(target_lengths, arc_length, path[:, 1])
+            return np.stack([x, y], axis=1)
+
+        # Use fine time step for noisy path
+        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
+        sim_duration = self.model.nt * dt  # Actual simulation duration
+
+        t_points_init1 = np.arange(0, sim_duration, dt)
+        t_points_init2 = np.arange(0, sim_duration, dt)
+        t_points_opt1 = np.arange(0, sim_duration, dt)
+        t_points_opt2 = np.arange(0, sim_duration, dt)
+
+        # Generate noisy paths
+        initial_path1 = np.array([model.sawtooth_trajectory(t, initial_laser_params[0])[:2] for t in t_points_init1])
+        initial_path2 = np.array([model.swirl_trajectory(t, initial_laser_params[1])[:2] for t in t_points_init2])
+        optimized_path1 = np.array([model.sawtooth_trajectory(t, optimized_laser_params[0])[:2] for t in t_points_opt1])
+        optimized_path2 = np.array([model.swirl_trajectory(t, optimized_laser_params[1])[:2] for t in t_points_opt2])
+
+        # Resample at constant arc length intervals
+        initial_path1 = resample_path(initial_path1, v_init1, dt)
+        initial_path2 = resample_path(initial_path2, v_init2, dt)
+        optimized_path1 = resample_path(optimized_path1, v_opt1, dt)
+        optimized_path2 = resample_path(optimized_path2, v_opt2, dt)
+
         # Convert to mm for plotting
         initial_path1_mm = initial_path1 * 1000
         initial_path2_mm = initial_path2 * 1000
@@ -1174,16 +1254,16 @@ class Visualization:
                 T_initial = np.ones((model.ny, model.nx)) * model.material['T0']
                 T_optimized = np.ones((model.ny, model.nx)) * model.material['T0']
             # Get actual time value for this frame
-            t = times[frame]
 
-            # Update the time title
-            time_title.set_text(f'Simulation Time: {t:.3f} s (Step {frame+1}/{len(times)})')
+            # For arc-length-based animation, use frame index as path index
+            t = frame * dt
+            time_title.set_text(f'Simulation Time: {t:.3f} s (Step {frame+1}/{len(initial_path1)})')
 
-            # Get current laser source positions
-            x_src_init1, y_src_init1 = initial_path1[frame]
-            x_src_init2, y_src_init2 = initial_path2[frame]
-            x_src_opt1, y_src_opt1 = optimized_path1[frame]
-            x_src_opt2, y_src_opt2 = optimized_path2[frame]
+            # Get current laser source positions (arc-length-based)
+            x_src_init1, y_src_init1 = initial_path1[frame] if frame < len(initial_path1) else initial_path1[-1]
+            x_src_init2, y_src_init2 = initial_path2[frame] if frame < len(initial_path2) else initial_path2[-1]
+            x_src_opt1, y_src_opt1 = optimized_path1[frame] if frame < len(optimized_path1) else optimized_path1[-1]
+            x_src_opt2, y_src_opt2 = optimized_path2[frame] if frame < len(optimized_path2) else optimized_path2[-1]
 
             # Convert to mm for plotting
             x_src_init1_mm = x_src_init1 * 1000
@@ -1227,7 +1307,7 @@ class Visualization:
             S_opt1 = model._gaussian_source(x_src_opt1, y_src_opt1, optimized_heat_params[0])
             S_opt2 = model._gaussian_source(x_src_opt2, y_src_opt2, optimized_heat_params[1])
 
-            thickness = model.material.get('thickness', 0.001)
+            thickness = model.material.get('thickness', 0.00017)
             rho = model.material['rho']
             cp = model.material['cp']
 
@@ -1275,8 +1355,9 @@ class Visualization:
             return artists
         
         # Create animation with fewer frames for smoother performance
-        frame_count = len(times)
-        
+
+        # Use the minimum length among all arc-length-resampled paths for frame count
+        frame_count = min(len(initial_path1), len(initial_path2), len(optimized_path1), len(optimized_path2))
         # Cap at reasonable number of frames
         if frame_count > max_frames:
             frame_skip = max(1, frame_count // max_frames)
@@ -1299,7 +1380,7 @@ class Visualization:
             save_interval = 0.01  # seconds
             next_save_time = 0.0
             for idx, frame in enumerate(frames_to_use):
-                t = times[frame]
+                t = frame * dt  # Approximate simulation time for this frame
                 # Save frame if we've reached or passed the next interval
                 if t >= next_save_time - 1e-6:
                     update(frame)  # Update the figure to this frame
@@ -1325,21 +1406,22 @@ class Visualization:
 def run_optimization():
     # 1. Setup material parameters for LPBF
     material_params = {
-        'T0': 20.0,                # Initial temperature (°C)
+        'T0': 21.0,                # Initial temperature (°C)
         'alpha': 5e-6,             # Thermal diffusivity (m²/s)
         'rho': 7800.0,             # Density (kg/m³)
         'cp': 500.0,               # Specific heat capacity (J/kg·K)
-        'thickness':  0.01,       # Thickness (m) (1mm?)
+
+        'thickness':  0.00017,       # Thickness (m)
         'T_melt': 1500.0,          # Melting temperature (°C)
         'k': 20.0,                 # Thermal conductivity (W/m·K)
         'absorptivity': 1,       # Laser absorptivity
     }
     
     # 2. Domain settings
-    domain_size = (0.005, 0.005)     # 10mm x 10mm domain
-    grid_size = (51, 51)           # Use a coarser grid for faster optimization
+    domain_size = (0.02, 0.0025)     # 20mm x 2.5mm domain
+    grid_size = (201, 26)           # Increase grid points for new aspect ratio (optional, can adjust)
     dt = 1e-4                      # 10μs time step
-    
+
     # 3. Initialize model
     model = HeatTransferModel(
         domain_size=domain_size,
@@ -1352,42 +1434,38 @@ def run_optimization():
     initial_params = {
         # Sawtooth path parameters
         'sawtooth_v': 0.05,         # 50 mm/s scan speed
-        'sawtooth_A': 0.001,        # 1mm amplitude 
-        'sawtooth_y0': 0.0025,       # Center position (3mm) -- now fixed
-        'sawtooth_period': 0.02,    # 20ms period
+        'sawtooth_A': 0.0002,        # 0.2mm amplitude
+
+        'sawtooth_y0': 0.00125,      # Center position (fixed)
+        'sawtooth_period': 0.01,    # 10ms period
+        'sawtooth_Q': 200.0,        # 200W laser power
+        'sawtooth_r0': 5e-5,        # 50μm beam radius
 
         # Swirl/Spiral path parameters
         'swirl_v': 0.05,            # 50 mm/s scan speed
-        'swirl_A': 0.001,           # 1mm amplitude
-        'swirl_y0': 0.0025,          # Center position (7mm) -- now fixed
-        'swirl_fr': 10.0,           # 10 Hz frequency
+        'swirl_A': 0.0002,          # 0.2mm amplitude
+        'swirl_y0': 0.00125,         # Center position (fixed)
+        'swirl_fr': 20.0,           # 20 Hz frequency
+        'swirl_Q': 200.0,           # 200W laser power
+        'swirl_r0': 5e-5,           # 50μm beam radius
 
-        # Laser parameters for Gaussian model (fixed, not optimized)
-        # 'Q': 300.0,                 # 300W laser power
-        # 'r0': 5e-5,                 # 50μm beam radius
+        # Noise parameter
+        'noise_sigma': 0.000      # Initial value for noise
     }
 
     # 5. Define parameter bounds
     bounds = {
-        # Velocity bounds (m/s) -- REMOVE from optimizable parameters
-        # 'sawtooth_v': (0.0001, 0.1),
-        # 'swirl_v': (0.0001, 0.1),
-
-        # Amplitude bounds (m)
-        'sawtooth_A': (0.00005, 0.002),
-        'swirl_A': (0.00005, 0.002),
-
-        # Position bounds (m) -- REMOVE y0 from bounds
-        # 'sawtooth_y0': (0.001, 0.003),
-        # 'swirl_y0': (0.001, 0.003),
-
-        # Time parameter bounds
+        'sawtooth_v': (0.01, 0.1),
+        'swirl_v': (0.01, 0.1),
+        'sawtooth_A': (0.00005, 0.00025),
+        'swirl_A': (0.00005, 0.00025),
         'sawtooth_period': (0.01, 0.05),
         'swirl_fr': (5.0, 20.0),
-
-        # Laser parameter bounds (REMOVE from optimizable parameters)
-        # 'Q': (50.0, 500.0),
-        # 'r0': (3e-5, 8e-5),
+        'sawtooth_Q': (50.0, 500.0),
+        'swirl_Q': (50.0, 500.0),
+        'sawtooth_r0': (3e-5, 8e-5),
+        'swirl_r0': (3e-5, 8e-5),
+        'noise_sigma': (0.0, 0.0005)  # Bounds for noise
     }
 
     # Set fixed laser parameters for simulation
@@ -1398,7 +1476,7 @@ def run_optimization():
         model=model,
         initial_params=initial_params,
         bounds=bounds,
-        x_range=(0.0, 0.008)  # 8mm scan length
+        x_range=(0.0025, 0.0175)  # 2.5mm to 17.5mm scan length
     )
     
     # 7. Run optimization
@@ -1488,7 +1566,9 @@ def run_optimization():
                 model, 
                 initial_params, 
                 optimized_params, 
-                fps=30
+                fps=30,
+                # Optionally, you can add arguments to crop the view to the scan region
+                # show_full_domain=False, y_crop=None
             )
             
         # Optional: Perform sensitivity analysis
@@ -1513,3 +1593,81 @@ def run_optimization():
     return model, optimizer, result, optimized_params# Run the optimization if script is executed directly
 if __name__ == "__main__":
     model, optimizer, result, optimized_params = run_optimization()
+
+
+import os
+def output_optimized_gcode(optimizer, optimized_params, filename="optimized_scan.gcode"):
+    """
+    Output the optimized scan path for both lasers as G-code.
+    Args:
+        optimizer: TrajectoryOptimizer instance
+        optimized_params: dict of optimized parameters
+        filename: output G-code filename
+    """
+    # Unpack parameters
+    params_array = optimizer.parameters_to_array(optimized_params)
+    laser_params, _ = optimizer.unpack_parameters(params_array)
+    sawtooth_params, swirl_params = laser_params
+
+    # Helper to resample a path at constant arc length intervals
+    def resample_path(path, v, dt=1e-5):
+        # Compute cumulative arc length
+        diffs = np.diff(path, axis=0)
+        seg_lengths = np.linalg.norm(diffs, axis=1)
+        arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
+        total_length = arc_length[-1]
+        # Number of points based on total length and speed
+        n_points = int(np.ceil(total_length / (v * dt)))
+        if n_points < 2:
+            n_points = 2
+        target_lengths = np.linspace(0, total_length, n_points)
+        # Interpolate x and y separately
+        x = np.interp(target_lengths, arc_length, path[:, 0])
+        y = np.interp(target_lengths, arc_length, path[:, 1])
+        return np.stack([x, y], axis=1)
+
+    # Determine scan duration (use slowest v)
+    x_start, x_end = optimizer.x_range
+    v1 = sawtooth_params['v']
+    v2 = swirl_params['v']
+    # Use a fine time step to capture noise
+    dt = 1e-5
+    total_time = max((x_end - x_start) / v1, (x_end - x_start) / v2)
+    t_points = np.arange(0, total_time, dt)
+
+    # Generate noisy paths at fine time intervals
+    saw_path = np.array([optimizer.model.sawtooth_trajectory(t, sawtooth_params)[:2] for t in t_points])
+    swirl_path = np.array([optimizer.model.swirl_trajectory(t, swirl_params)[:2] for t in t_points])
+
+    # Resample paths at constant arc length intervals (matching the speed)
+    saw_path_resampled = resample_path(saw_path, v1, dt)
+    swirl_path_resampled = resample_path(swirl_path, v2, dt)
+
+    # Write G-code
+    with open(filename, 'w') as f:
+        f.write("; Optimized dual-laser scan G-code\n")
+        f.write("G21 ; Set units to mm\n")
+        f.write("G90 ; Absolute positioning\n")
+        f.write("M3 S255 ; Laser ON (example)\n")
+        f.write("; Sawtooth laser path\n")
+        for x, y in saw_path_resampled * 1000:  # convert to mm
+            f.write(f"G1 X{x:.3f} Y{y:.3f} ; Sawtooth\n")
+        f.write("; Swirl laser path\n")
+        for x, y in swirl_path_resampled * 1000:
+            f.write(f"G1 X{x:.3f} Y{y:.3f} ; Swirl\n")
+        f.write("M5 ; Laser OFF\n")
+    print(f"G-code written to {filename}")
+
+if __name__ == "__main__":
+    # ...existing code for setting up and running optimization...
+    # Example:
+    # optimizer = TrajectoryOptimizer(...)
+    # result, optimized_params = optimizer.optimize(...)
+    # (Replace above with your actual optimization code)
+
+    # Prompt for G-code export after optimization
+    user_input = input("\nWould you like to output the optimized scan as G-code? (y/n): ").strip().lower()
+    if user_input == 'y':
+        output_optimized_gcode(optimizer, optimized_params)
+    else:
+        print("G-code export skipped.")
