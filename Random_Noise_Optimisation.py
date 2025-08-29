@@ -32,7 +32,7 @@ class HeatTransferModel:
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K)
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.00017  # Plate thickness (m)
+            'thickness': 0.0041  # Plate thickness (m)
         }
         self.material = default_params if material_params is None else material_params
         self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
@@ -785,624 +785,282 @@ class Visualization:
     def __init__(self, model):
         self.model = model
 
+    def generate_raster_scan(self, x_start, x_end, y_start, y_end, n_lines, speed):
+        """Generate a raster scan path covering the area."""
+        import numpy as np
+        x_vals = np.linspace(x_start, x_end, self.model.nx)
+        y_vals = np.linspace(y_start, y_end, n_lines)
+        path = []
+        for i, y in enumerate(y_vals):
+            xs = x_vals if i % 2 == 0 else x_vals[::-1]
+            for x in xs:
+                path.append((x, y))
+        return np.array(path), speed
+
     def compare_simulations(self, initial_params, optimized_params, use_gaussian=True, y_crop=None, show_full_domain=True):
-        
         import matplotlib.pyplot as plt
         import numpy as np
         from matplotlib.colors import LinearSegmentedColormap
-        
-        # Create a temporary optimizer with the correct parameters
+
+        # --- Raster scan setup ---
+        x_start, x_end = 0, self.model.Lx
+        y_start = 0.0010  # 1.0 mm
+        y_end = 0.0015    # 1.5 mm
+        hatch_spacing = 0.00005  # 0.05 mm
+        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
+        raster_speed = 0.05  # 50 mm/s in m/s
+        raster_path, raster_v = self.generate_raster_scan(x_start, x_end, y_start, y_end, n_lines, raster_speed)
+
+        # Simulate raster scan: treat as a single laser moving along raster_path
+        heat_params = (
+            {'Q': 200.0, 'r0': 0.00005},  # 200W, 0.05mm spot size
+            {'Q': 200.0, 'r0': 0.00005}
+        )
+        def raster_trajectory(t, params):
+            idx = int(t * raster_v * len(raster_path) / (x_end - x_start))
+            idx = np.clip(idx, 0, len(raster_path) - 1)
+            x, y = raster_path[idx]
+            return x, y, 1, 0
+
+        orig_sawtooth = self.model.sawtooth_trajectory
+        orig_swirl = self.model.swirl_trajectory
+        self.model.sawtooth_trajectory = raster_trajectory
+        self.model.swirl_trajectory = raster_trajectory
+
+        raster_laser_params = (
+            {'v': raster_v, 'A': 0, 'y0': 0, 'period': 1, 'noise_sigma': 0},
+            {'v': raster_v, 'A': 0, 'y0': 0, 'fr': 1, 'noise_sigma': 0}
+        )
+        T_raster = self.model.simulate((raster_laser_params, heat_params), use_gaussian=use_gaussian)
+
+        # Restore original trajectory functions
+        self.model.sawtooth_trajectory = orig_sawtooth
+        self.model.swirl_trajectory = orig_swirl
+
+        # --- Optimized simulation ---
         temp_optimizer = TrajectoryOptimizer(self.model, initial_params=initial_params, bounds=None)
-        
-        # Unpack parameters
-        initial_array = temp_optimizer.parameters_to_array(initial_params)
         optimized_array = temp_optimizer.parameters_to_array(optimized_params)
-        
-        laser_init, heat_init = temp_optimizer.unpack_parameters(initial_array)
         laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
-
-        v_init1 = laser_init[0]['v']
-        v_init2 = laser_init[1]['v']
-        v_opt1 = laser_opt[0]['v']
-        v_opt2 = laser_opt[1]['v']
-
-        # Run simulations
-        T_init = self.model.simulate((laser_init, heat_init), use_gaussian=use_gaussian)
         T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian)
 
-        # Set the color scale bar for the animation to the highest temperature seen during the simulation
-        T_min = 0
-        T_max = max(np.max(T_init), np.max(T_opt))
+        # --- Generate scan paths for overlay ---
+        dt = self.model.dt
+        nt = self.model.nt
+        t_points = np.linspace(0, nt * dt, nt)
+        raster_x_time = []
+        raster_y_time = []
+        for t in t_points:
+            x, y, _, _ = raster_trajectory(t, raster_laser_params[0])
+            raster_x_time.append(x * 1000)
+            raster_y_time.append(y * 1000)
 
-        # Create a better temperature colormap
+        sawtooth_params, swirl_params = laser_opt
+        saw_x = []
+        saw_y = []
+        swirl_x = []
+        swirl_y = []
+        for t in t_points:
+            x1, y1, _, _ = self.model.sawtooth_trajectory(t, sawtooth_params)
+            x2, y2, _, _ = self.model.swirl_trajectory(t, swirl_params)
+            saw_x.append(x1 * 1000)
+            saw_y.append(y1 * 1000)
+            swirl_x.append(x2 * 1000)
+            swirl_y.append(y2 * 1000)
+
+        # --- Compute gradients ---
+        _, _, grad_raster = self.model.compute_temperature_gradients(T_raster)
+        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
+
+        # --- Visualization ---
         colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
         cmap_temp = LinearSegmentedColormap.from_list('thermal', colors)
-        
-        # Create a figure with subplots
-        fig = plt.figure(figsize=(16, 12))
-        gs = plt.GridSpec(2, 3, figure=fig)
-        
-        # Assign subplots
-        ax1 = fig.add_subplot(gs[0, 0])  # Initial temperature
-        ax2 = fig.add_subplot(gs[0, 1])  # Optimized temperature
-        ax3 = fig.add_subplot(gs[0, 2])  # Path comparison
-        ax4 = fig.add_subplot(gs[1, 0])  # Initial gradient
-        ax5 = fig.add_subplot(gs[1, 1])  # Optimized gradient
-        # ax6 = fig.add_subplot(gs[1, 2])  # Melt pool metrics (REMOVED)
-        
-        # Define the full physical extent for proper rendering
-        full_extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]  # [x_min, x_max, y_min, y_max] in mm
-        
-        # Define view limits
-        if show_full_domain:
-            # Show the entire domain
-            x_min, x_max = 0, self.model.Lx * 1000  # mm
-            y_min, y_max = 0, self.model.Ly * 1000  # mm
-        else:
-            # Show the cropped view
-            x_min, x_max = 0, self.model.Lx * 1000  # mm
-            if y_crop is None:
-                y_crop = (0.002, 0.008)  # default crop in meters
-            y_min, y_max = y_crop[0] * 1000, y_crop[1] * 1000  # mm
-        
+        fig = plt.figure(figsize=(16, 8))
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax2 = fig.add_subplot(2, 2, 2)
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax4 = fig.add_subplot(2, 2, 4)
 
-        # --- Arc-length-based resampling for physically accurate path visualization ---
-        def resample_path(path, v, dt):
-            diffs = np.diff(path, axis=0)
-            seg_lengths = np.linalg.norm(diffs, axis=1)
-            arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
-            total_length = arc_length[-1]
-            n_points = int(np.ceil(total_length / (v * dt)))
-            if n_points < 2:
-                n_points = 2
-            target_lengths = np.linspace(0, total_length, n_points)
-            x = np.interp(target_lengths, arc_length, path[:, 0])
-            y = np.interp(target_lengths, arc_length, path[:, 1])
-            return np.stack([x, y], axis=1)
-
-        # Use fine time step for noisy path
-        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
-        sim_duration = self.model.nt * dt  # Actual simulation duration
-
-        t_points_init1 = np.arange(0, sim_duration, dt)
-        t_points_init2 = np.arange(0, sim_duration, dt)
-        t_points_opt1 = np.arange(0, sim_duration, dt)
-        t_points_opt2 = np.arange(0, sim_duration, dt)
-
-        # Generate noisy paths
-        init_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_init[0])[:2] for t in t_points_init1])
-        init_swirl_path = np.array([self.model.swirl_trajectory(t, laser_init[1])[:2] for t in t_points_init2])
-        opt_saw_path = np.array([self.model.sawtooth_trajectory(t, laser_opt[0])[:2] for t in t_points_opt1])
-        opt_swirl_path = np.array([self.model.swirl_trajectory(t, laser_opt[1])[:2] for t in t_points_opt2])
-
-        # Resample at constant arc length intervals
-        init_saw_path = resample_path(init_saw_path, v_init1, dt)
-        init_swirl_path = resample_path(init_swirl_path, v_init2, dt)
-        opt_saw_path = resample_path(opt_saw_path, v_opt1, dt)
-        opt_swirl_path = resample_path(opt_swirl_path, v_opt2, dt)
-        
-        # Convert to mm
-        init_saw_path_mm = init_saw_path * 1000
-        init_swirl_path_mm = init_swirl_path * 1000
-        opt_saw_path_mm = opt_saw_path * 1000
-        opt_swirl_path_mm = opt_swirl_path * 1000
-        
-        # Generate physical coordinates for contours
-        x_phys = np.linspace(0, self.model.Lx, self.model.nx) * 1000  # mm
-        y_phys = np.linspace(0, self.model.Ly, self.model.ny) * 1000  # mm
-        X_phys, Y_phys = np.meshgrid(x_phys, y_phys)
-
-        # Compute gradients for initial and optimized temperature fields
-        _, _, grad_init = self.model.compute_temperature_gradients(T_init)
-        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
-        
-        # Display temperature field using the full domain for both rendering and extent
-        im1 = ax1.imshow(T_init, extent=full_extent, origin='lower', 
-                        cmap=cmap_temp, interpolation='bilinear', aspect='auto')
-        
-        # Plot laser paths on temperature field with increased visibility
-        ax1.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'w-', linewidth=2.5, alpha=0.9)
-        ax1.plot(init_swirl_path_mm[:, 0], init_swirl_path_mm[:, 1], 'g-', linewidth=2.5, alpha=0.9)
-
-
-        # Add markers for current positions with increased visibility
-        ax1.plot(init_saw_path_mm[-1, 0], init_saw_path_mm[-1, 1], 'wo', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
-        ax1.plot(init_swirl_path_mm[-1, 0], init_swirl_path_mm[-1, 1], 'go', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
-        # Add legend for the 15mm marker
-        ax1.legend(loc='upper right', fontsize=9, frameon=True)
-        
-        # Add metrics text
-        melt_temp = self.model.material.get('T_melt', self.model.material['T0'] + 100)
-        melt_mask_init = T_init > melt_temp
-        melt_count_init = np.sum(melt_mask_init)
-        max_temp_init = np.max(T_init)
-
-        if melt_count_init > 0:
-            T_melt_init = T_init[melt_mask_init]
-            cv_init = np.std(T_melt_init) / np.mean(T_melt_init) * 100
-            metrics_text = f"Max Temp: {max_temp_init:.0f}°C\nMelt Pool: {melt_count_init} pts\nCV: {cv_init:.1f}%"
-        else:
-            metrics_text = f"Max Temp: {max_temp_init:.0f}°C"
-        
-        text_box = ax1.text(0.05, 0.95, metrics_text, transform=ax1.transAxes, fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='black', 
-                                                        alpha=0.7))
-        # Explicitly set text color to white
-        text_box.set_color('white')
-        
-        ax1.set_title(f'Initial Temperature (Max: {np.max(T_init):.0f}°C)')
+        extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]
+        im1 = ax1.imshow(T_raster, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto')
+        ax1.set_title('Raster Scan Temperature')
         ax1.set_xlabel('X (mm)')
         ax1.set_ylabel('Y (mm)')
-        ax1.set_xlim(x_min, x_max)
-        ax1.set_ylim(y_min, y_max)
         fig.colorbar(im1, ax=ax1, label='Temperature (°C)')
-        
-        # Plot optimized temperature field
-        im2 = ax2.imshow(T_opt, extent=full_extent, origin='lower', 
-                        cmap=cmap_temp, interpolation='bilinear', aspect='auto')
-        
-        # Plot laser paths on temperature field with increased visibility
-        ax2.plot(opt_saw_path_mm[:, 0], opt_saw_path_mm[:, 1], 'w-', linewidth=2.5, alpha=0.9)
-        ax2.plot(opt_swirl_path_mm[:, 0], opt_swirl_path_mm[:, 1], 'g-', linewidth=2.5, alpha=0.9)
-        
-        # Add markers for current positions with increased visibility
-        ax2.plot(opt_saw_path_mm[-1, 0], opt_saw_path_mm[-1, 1], 'wo', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
-        ax2.plot(opt_swirl_path_mm[-1, 0], opt_swirl_path_mm[-1, 1], 'go', markersize=10, markeredgecolor='k', markeredgewidth=1.5)
-        
-        # Add metrics text
-        melt_mask_opt = T_opt > melt_temp
-        melt_count_opt = np.sum(melt_mask_opt)
-        max_temp_opt = np.max(T_opt)
+        ax1.plot(raster_x_time, raster_y_time, color='black', linewidth=1, label='Raster Laser Path')
+        ax1.legend()
 
-        if melt_count_opt > 0:
-            T_melt_opt = T_opt[melt_mask_opt]
-            cv_opt = np.std(T_melt_opt) / np.mean(T_melt_opt) * 100
-            metrics_text = f"Max Temp: {max_temp_opt:.0f}°C\nMelt Pool: {melt_count_opt} pts\nCV: {cv_opt:.1f}%"
-        else:
-            metrics_text = f"Max Temp: {max_temp_opt:.0f}°C"
-        
-        text_box = ax2.text(0.05, 0.95, metrics_text, transform=ax2.transAxes, fontsize=10,
-                        verticalalignment='top', bbox=dict(boxstyle='round', facecolor='black', 
-                                                        alpha=0.7))
-        # Explicitly set text color to white
-        text_box.set_color('white')
-        
-        ax2.set_title(f'Optimized Temperature (Max: {np.max(T_opt):.0f}°C)')
+        im2 = ax2.imshow(T_opt, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto')
+        ax2.set_title('Optimized Scan Temperature')
         ax2.set_xlabel('X (mm)')
         ax2.set_ylabel('Y (mm)')
-        ax2.set_xlim(x_min, x_max)
-        ax2.set_ylim(y_min, y_max)
         fig.colorbar(im2, ax=ax2, label='Temperature (°C)')
-        
-        # Plot path comparison
-        ax3.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'b-', label='Initial Sawtooth', linewidth=2)
-        ax3.plot(init_swirl_path_mm[:, 0], init_swirl_path_mm[:, 1], 'g-', label='Initial Swirl', linewidth=2)
-        ax3.plot(opt_saw_path_mm[:, 0], opt_saw_path_mm[:, 1], 'r-', label='Optimized Sawtooth', linewidth=2)
-        ax3.plot(opt_swirl_path_mm[:, 0], opt_swirl_path_mm[:, 1], 'm-', label='Optimized Swirl', linewidth=2)
-        
-        # Add markers
-        ax3.plot(init_saw_path_mm[-1, 0], init_saw_path_mm[-1, 1], 'bo', markersize=8, markeredgecolor='k')
-        ax3.plot(init_swirl_path_mm[-1, 0], init_swirl_path_mm[-1, 1], 'go', markersize=8, markeredgecolor='k')
-        ax3.plot(opt_saw_path_mm[-1, 0], opt_saw_path_mm[-1, 1], 'ro', markersize=8, markeredgecolor='k')
-        ax3.plot(opt_swirl_path_mm[-1, 0], opt_swirl_path_mm[-1, 1], 'mo', markersize=8, markeredgecolor='k')
-        
-        ax3.set_title('Laser Path Comparison')
+        ax2.plot(saw_x, saw_y, color='red', linewidth=1, label='Sawtooth Path')
+        ax2.plot(swirl_x, swirl_y, color='black', linewidth=1, label='Swirl Path')
+        ax2.legend();
+
+        # --- Gradient plots with overlays ---
+        grad_cmap = plt.get_cmap('viridis')
+        im3 = ax3.imshow(grad_raster, extent=extent, origin='lower', cmap=grad_cmap, aspect='auto')
+        ax3.set_title('Raster Scan Temperature Gradient')
         ax3.set_xlabel('X (mm)')
         ax3.set_ylabel('Y (mm)')
-        ax3.set_xlim(x_min, x_max)
-        ax3.set_ylim(y_min, y_max)
+        fig.colorbar(im3, ax=ax3, label='|∇T| (°C/mm)')
+        ax3.plot(raster_x_time, raster_y_time, color='black', linewidth=1, label='Raster Laser Path')
         ax3.legend()
-        ax3.grid(True, alpha=0.3)
-        
-        # Plot gradient fields
-        im4 = ax4.imshow(grad_init/1000, extent=full_extent, origin='lower', 
-                        cmap='viridis', interpolation='bilinear', aspect='auto')
-        
-        # Plot paths on gradient field
-        ax4.plot(init_saw_path_mm[:, 0], init_saw_path_mm[:, 1], 'w-', linewidth=1.5, alpha=0.7)
-        ax4.plot(init_swirl_path_mm[:, 0], init_swirl_path_mm[:, 1], 'g-', linewidth=1.5, alpha=0.7)
-        
-        ax4.set_title(f'Initial Gradient (Max: {np.max(grad_init)/1000:.0f}°C/mm)')
+
+        im4 = ax4.imshow(grad_opt, extent=extent, origin='lower', cmap=grad_cmap, aspect='auto')
+        ax4.set_title('Optimized Scan Temperature Gradient')
         ax4.set_xlabel('X (mm)')
         ax4.set_ylabel('Y (mm)')
-        ax4.set_xlim(x_min, x_max)
-        ax4.set_ylim(y_min, y_max)
-        fig.colorbar(im4, ax=ax4, label='Gradient (°C/mm)')
-        
-        # Plot optimized gradient field
-        im5 = ax5.imshow(grad_opt/1000, extent=full_extent, origin='lower', 
-                        cmap='viridis', interpolation='bilinear', aspect='auto')
-        
-        # Plot paths on gradient field
-        ax5.plot(opt_saw_path_mm[:, 0], opt_saw_path_mm[:, 1], 'w-', linewidth=1.5, alpha=0.7)
-        ax5.plot(opt_swirl_path_mm[:, 0], opt_swirl_path_mm[:, 1], 'g-', linewidth=1.5, alpha=0.7)
-        
-        ax5.set_title(f'Optimized Gradient (Max: {np.max(grad_opt)/1000:.0f}°C/mm)')
-        ax5.set_xlabel('X (mm)')
-        ax5.set_ylabel('Y (mm)')
-        ax5.set_xlim(x_min, x_max)
-        ax5.set_ylim(y_min, y_max)
-        fig.colorbar(im5, ax=ax5, label='Gradient (°C/mm)')
-        
-        plt.suptitle('LPBF Dual Laser Scan Optimization: Initial vs. Optimized', fontsize=16)
-        plt.tight_layout(rect=[0, 0, 1, 0.94])
-        plt.subplots_adjust(bottom=0.1, wspace=0.25, hspace=0.3)  # Adjust spacing
+        fig.colorbar(im4, ax=ax4, label='|∇T| (°C/mm)')
+        ax4.plot(saw_x, saw_y, color='red', linewidth=1, label='Sawtooth Path')
+        ax4.plot(swirl_x, swirl_y, color='black', linewidth=1, label='Swirl Path')
+        ax4.legend()
 
-        # Add a label below the figure to explain the scan path colors (matching the animation)
-        fig.text(
-            0.5, 0.01,
-            "White line: Sawtooth scan path    |    Green line: Swirl scan path",
-            ha='center', va='bottom', fontsize=11, color='black'
-        )
-
+        plt.tight_layout()
         plt.show()
-        
         return fig
-    
-    def animate_optimization_results(self, model, initial_params, optimized_params, fps=20, 
-                               use_gaussian=True, y_crop=None, show_full_domain=True, save_gif=False,
-                               filename='laser_optimization.gif', max_frames=200, simulation_duration=0.1):
-        """
-        Enhanced animation with fixed rendering issues.
-        
-        Parameters:
-        -----------
-        model: object
-            The simulation model
-        initial_params: dict
-            Dictionary of initial parameters
-        optimized_params: dict
-            Dictionary of optimized parameters
-        fps: int
-            Frames per second for animation
-        use_gaussian: bool
-            Whether to use Gaussian or Goldak heat source model
-        y_crop: tuple or None
-            (y_min, y_max) in meters to crop the y-axis. If None, uses (0, model.Ly).
-            Only applied if show_full_domain is False.
-        show_full_domain: bool
-            If True, shows the entire domain regardless of y_crop setting
-        save_gif: bool
-            Whether to save animation as GIF
-        filename: str
-            Filename for saving GIF
-        max_frames: int
-            Maximum number of frames to include in animation
-        simulation_duration: float
-            Duration to run the simulation in seconds (default: 0.01)
-            Increase this value to make the animation run longer and extend further in x-direction
-        """
-        import matplotlib.animation as animation
+
+    def animate_optimization_results(self, model, initial_params, optimized_params, fps=30, show_full_domain=True, y_crop=None, save_snapshots=True, snapshot_interval=0.01, snapshot_dir="animation_snapshots"):
         import matplotlib.pyplot as plt
+        from matplotlib.animation import FuncAnimation
         import numpy as np
         from matplotlib.colors import LinearSegmentedColormap
-        from matplotlib.patches import Patch
-        
-        # Create a better temperature colormap
+        import os
+
+        # --- Raster scan setup ---
+        x_start, x_end = 0, self.model.Lx
+        y_start = 0.0010  # 1.0 mm
+        y_end = 0.0015    # 1.5 mm
+        hatch_spacing = 0.00005  # 0.05 mm
+        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
+        raster_speed = 0.2  # 200 mm/s in m/s
+        raster_path, raster_v = self.generate_raster_scan(x_start, x_end, y_start, y_end, n_lines, raster_speed)
+
+        heat_params = (
+            {'Q': 200.0, 'r0': 0.00005},
+            {'Q': 200.0, 'r0': 0.00005}
+        )
+        def raster_trajectory(t, params):
+            idx = int(t * raster_v * len(raster_path) / (x_end - x_start))
+            idx = np.clip(idx, 0, len(raster_path) - 1)
+            x, y = raster_path[idx]
+            return x, y, 1, 0
+
+        # --- Optimized scan setup ---
+        temp_optimizer = TrajectoryOptimizer(self.model, initial_params=initial_params, bounds=None)
+        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
+        laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
+        sawtooth_params, swirl_params = laser_opt
+
+        # --- Animation setup ---
+        dt = self.model.dt
+        nt = self.model.nt
+        t_points = np.linspace(0, nt * dt, nt)
         colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
         cmap_temp = LinearSegmentedColormap.from_list('thermal', colors)
-        
-        # Create optimizer and unpack parameters
-        temp_optimizer = TrajectoryOptimizer(model, initial_params=initial_params, bounds=None)
-        
-        initial_array = temp_optimizer.parameters_to_array(initial_params)
-        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
 
-        initial_laser_params, initial_heat_params = temp_optimizer.unpack_parameters(initial_array)
-        optimized_laser_params, optimized_heat_params = temp_optimizer.unpack_parameters(optimized_array)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]
 
-        v_init1 = initial_laser_params[0]['v']
-        v_init2 = initial_laser_params[1]['v']
-        v_opt1 = optimized_laser_params[0]['v']
-        v_opt2 = optimized_laser_params[1]['v']
+        # Initial temperature fields
+        T_raster = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+        T_opt = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
 
-        # Run simulations
-        T_init = self.model.simulate((initial_laser_params, initial_heat_params), use_gaussian=use_gaussian)
-        T_opt = self.model.simulate((optimized_laser_params, optimized_heat_params), use_gaussian=use_gaussian)
+        # Set temperature scale (vmin/vmax) for better visualization
+        temp_vmin = self.model.material['T0']
+        temp_vmax = 200  # Set to 200°C
 
-        # Set the color scale bar for the animation to the highest temperature seen during the simulation
-        T_min = 0
-        T_max = max(np.max(T_init), np.max(T_opt))
+        im1 = ax1.imshow(T_raster, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=temp_vmax)
+        ax1.set_title('Raster Scan Temperature')
+        ax1.set_xlabel('X (mm)')
+        ax1.set_ylabel('Y (mm)')
+        raster_laser_dot, = ax1.plot([], [], 'ko', markersize=6, label='Raster Laser')
+        ax1.legend()
 
-        # Define physical coordinate extents
-        full_extent = [0, model.Lx * 1000, 0, model.Ly * 1000]  # [x_min, x_max, y_min, y_max] in mm
-        
-        # Define view limits based on parameters
-        if show_full_domain:
-            # Show the entire domain
-            x_min, x_max = 0, model.Lx * 1000  # mm
-            y_min, y_max = 0, model.Ly * 1000  # mm
-        else:
-            # Show the cropped view
-            x_min, x_max = 0, model.Lx * 1000  # mm
-            if y_crop is None:
-                y_crop = (0.002, 0.008)  # default crop in meters
-            y_min, y_max = y_crop[0] * 1000, y_crop[1] * 1000  # mm
-        
+        im2 = ax2.imshow(T_opt, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=temp_vmax)
+        ax2.set_title('Optimized Scan Temperature')
+        ax2.set_xlabel('X (mm)')
+        ax2.set_ylabel('Y (mm)')
+        saw_dot, = ax2.plot([], [], 'ro', markersize=6, label='Sawtooth Laser')
+        swirl_dot, = ax2.plot([], [], 'ko', markersize=6, label='Swirl Laser')
+        ax2.legend()
 
-        # --- Arc-length-based resampling for physically accurate animation ---
-        def resample_path(path, v, dt):
-            diffs = np.diff(path, axis=0)
-            seg_lengths = np.linalg.norm(diffs, axis=1)
-            arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
-            total_length = arc_length[-1]
-            n_points = int(np.ceil(total_length / (v * dt)))
-            if n_points < 2:
-                n_points = 2
-            target_lengths = np.linspace(0, total_length, n_points)
-            x = np.interp(target_lengths, arc_length, path[:, 0])
-            y = np.interp(target_lengths, arc_length, path[:, 1])
-            return np.stack([x, y], axis=1)
+        plt.tight_layout()
 
-        # Use fine time step for noisy path
-        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
-        sim_duration = self.model.nt * dt  # Actual simulation duration
+        # Precompute raster positions for speed
+        raster_positions = [raster_trajectory(t, {'v': raster_v, 'A': 0, 'y0': 0, 'period': 1, 'noise_sigma': 0}) for t in t_points]
+        # Precompute optimized positions for speed
+        saw_positions = [self.model.sawtooth_trajectory(t, sawtooth_params) for t in t_points]
+        swirl_positions = [self.model.swirl_trajectory(t, swirl_params) for t in t_points]
 
-        t_points_init1 = np.arange(0, sim_duration, dt)
-        t_points_init2 = np.arange(0, sim_duration, dt)
-        t_points_opt1 = np.arange(0, sim_duration, dt)
-        t_points_opt2 = np.arange(0, sim_duration, dt)
+        # --- Snapshot saving setup ---
+        if save_snapshots:
+            if not os.path.exists(snapshot_dir):
+                os.makedirs(snapshot_dir)
+            snapshot_frames = set()
+            total_time = nt * dt
+            snapshot_times = np.arange(0, total_time, snapshot_interval)
+            # Find closest frame indices for each snapshot time
+            for snap_time in snapshot_times:
+                frame_idx = int(np.round(snap_time / dt))
+                if frame_idx < nt:
+                    snapshot_frames.add(frame_idx)
 
-        # Generate noisy paths
-        initial_path1 = np.array([model.sawtooth_trajectory(t, initial_laser_params[0])[:2] for t in t_points_init1])
-        initial_path2 = np.array([model.swirl_trajectory(t, initial_laser_params[1])[:2] for t in t_points_init2])
-        optimized_path1 = np.array([model.sawtooth_trajectory(t, optimized_laser_params[0])[:2] for t in t_points_opt1])
-        optimized_path2 = np.array([model.swirl_trajectory(t, optimized_laser_params[1])[:2] for t in t_points_opt2])
-
-        # Resample at constant arc length intervals
-        initial_path1 = resample_path(initial_path1, v_init1, dt)
-        initial_path2 = resample_path(initial_path2, v_init2, dt)
-        optimized_path1 = resample_path(optimized_path1, v_opt1, dt)
-        optimized_path2 = resample_path(optimized_path2, v_opt2, dt)
-
-        # Convert to mm for plotting
-        initial_path1_mm = initial_path1 * 1000
-        initial_path2_mm = initial_path2 * 1000
-        optimized_path1_mm = optimized_path1 * 1000
-        optimized_path2_mm = optimized_path2 * 1000
-        
-        # Setup figure and subplots
-        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-        fig.suptitle('Dual Laser Heat Transfer Optimization', fontsize=16)
-
-        # Configure axes with proper mm scale
-        for ax in axes:
-            ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_min, y_max)
-            ax.set_xlabel('X (mm)')
-            ax.set_ylabel('Y (mm)')
-            ax.grid(False)  # Remove grid lines
-
-        axes[0].set_title('Initial Parameters', fontsize=14)
-        axes[1].set_title('Optimized Parameters', fontsize=14)
-
-        # Initialize temperature field images with fixed color scale
-        init_field = np.ones((model.ny, model.nx)) * model.material['T0']
-
-        image_initial = axes[0].imshow(init_field, extent=full_extent, origin='lower', 
-                                    cmap=cmap_temp, vmin=T_min, vmax=T_max,
-                                    interpolation='bilinear', aspect='auto')
-
-        image_optimized = axes[1].imshow(init_field, extent=full_extent, origin='lower', 
-                                    cmap=cmap_temp, vmin=T_min, vmax=T_max,
-                                    interpolation='bilinear', aspect='auto')
-
-        # Add colorbars with fixed limits
-        cbar_initial = fig.colorbar(image_initial, ax=axes[0])
-        cbar_initial.set_label('Temperature (°C)')
-        cbar_optimized = fig.colorbar(image_optimized, ax=axes[1])
-        cbar_optimized.set_label('Temperature (°C)')
-        
-        # Physical coordinates for contours
-        x_phys = np.linspace(0, model.Lx * 1000, model.nx)
-        y_phys = np.linspace(0, model.Ly * 1000, model.ny)
-        X_phys, Y_phys = np.meshgrid(x_phys, y_phys)
-        
-        # Initialize laser markers
-        source_marker_initial1, = axes[0].plot([], [], 'wo', markersize=10, markeredgecolor='black',
-                                            markeredgewidth=1.5, zorder=10)
-        source_marker_initial2, = axes[0].plot([], [], 'go', markersize=10, markeredgecolor='black',
-                                            markeredgewidth=1.5, zorder=10)
-        source_marker_optimized1, = axes[1].plot([], [], 'wo', markersize=10, markeredgecolor='black',
-                                            markeredgewidth=1.5, zorder=10)
-        source_marker_optimized2, = axes[1].plot([], [], 'go', markersize=10, markeredgecolor='black',
-                                            markeredgewidth=1.5, zorder=10)
-        
-        # Initialize path lines
-        path_line_initial1, = axes[0].plot([], [], 'w-', linewidth=2, alpha=0.8)
-        path_line_initial2, = axes[0].plot([], [], 'g-', linewidth=2, alpha=0.8)
-        path_line_optimized1, = axes[1].plot([], [], 'w-', linewidth=2, alpha=0.8)
-        path_line_optimized2, = axes[1].plot([], [], 'g-', linewidth=2, alpha=0.8)
-        
-        # Add temperature info text
-        temp_text_initial = axes[0].text(0.02, 0.97, '', transform=axes[0].transAxes,
-                                    fontsize=10, color='white', verticalalignment='top',
-                                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
-        
-        temp_text_optimized = axes[1].text(0.02, 0.97, '', transform=axes[1].transAxes,
-                                        fontsize=10, color='white', verticalalignment='top',
-                                        bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
-        
-        # Add a title for time
-        time_title = plt.figtext(0.5, 0.95, '', ha='center', va='top', fontsize=12)
-        
-        # Add figure legend
-        legend_elements = [
-            plt.Line2D([0], [0], color='white', marker='o', markersize=8, markerfacecolor='white',
-                    markeredgecolor='black', label='Sawtooth Laser'),
-            plt.Line2D([0], [0], color='green', marker='o', markersize=8, markerfacecolor='green',
-                    markeredgecolor='black', label='Swirl Laser')
-        ]
-        fig.legend(handles=legend_elements, loc='lower center', 
-                bbox_to_anchor=(0.5, 0.02), ncol=2, fontsize=12)
-        
-        # Initialize temperature fields
-        T_initial = init_field.copy()
-        T_optimized = init_field.copy()
-        
-        # Reset temperature fields before animation starts
-        T_initial = np.ones((model.ny, model.nx)) * model.material['T0']
-        T_optimized = np.ones((model.ny, model.nx)) * model.material['T0']
-
-        # Store the variable for updating color limits
-        T_max = T_max
-        
         def update(frame):
-            """Update function with temperature field and laser scan paths."""
-            nonlocal T_initial, T_optimized
+            # Raster scan update
+            frame_idx = frame
+            if frame_idx >= len(raster_path):
+                frame_idx = len(raster_path) - 1
+            x_r, y_r = raster_path[frame_idx]
+            S_r = self.model._gaussian_source(x_r, y_r, heat_params[0])
             if frame == 0:
-                T_initial = np.ones((model.ny, model.nx)) * model.material['T0']
-                T_optimized = np.ones((model.ny, model.nx)) * model.material['T0']
-            # Get actual time value for this frame
+                update.T_raster = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+            lap_r = self.model._laplacian(update.T_raster)
+            update.T_raster = update.T_raster + dt * self.model.material['alpha'] * lap_r
+            update.T_raster = update.T_raster + dt * S_r / (self.model.dx * self.model.dy * self.model.thickness * self.model.material['rho'] * self.model.material['cp'])
+            update.T_raster[0, :] = self.model.material['T0']
+            update.T_raster[-1, :] = self.model.material['T0']
+            update.T_raster[:, 0] = self.model.material['T0']
+            update.T_raster[:, -1] = self.model.material['T0']
+            im1.set_array(update.T_raster)
+            raster_laser_dot.set_data([x_r * 1000], [y_r * 1000])
 
-            # For arc-length-based animation, use frame index as path index
-            t = frame * dt
-            time_title.set_text(f'Simulation Time: {t:.3f} s (Step {frame+1}/{len(initial_path1)})')
+            # Optimized scan update (dual-laser)
+            x_saw, y_saw, _, _ = saw_positions[frame]
+            x_swirl, y_swirl, _, _ = swirl_positions[frame]
+            S1 = self.model._gaussian_source(x_saw, y_saw, heat_opt[0])
+            S2 = self.model._gaussian_source(x_swirl, y_swirl, heat_opt[1])
+            S_total = S1 + S2
+            if frame == 0:
+                update.T_opt = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+            lap_opt = self.model._laplacian(update.T_opt)
+            update.T_opt = update.T_opt + dt * self.model.material['alpha'] * lap_opt
+            update.T_opt = update.T_opt + dt * S_total / (self.model.dx * self.model.dy * self.model.thickness * self.model.material['rho'] * self.model.material['cp'])
+            update.T_opt[0, :] = self.model.material['T0']
+            update.T_opt[-1, :] = self.model.material['T0']
+            update.T_opt[:, 0] = self.model.material['T0']
+            update.T_opt[:, -1] = self.model.material['T0']
+            im2.set_array(update.T_opt)
+            saw_dot.set_data([x_saw * 1000], [y_saw * 1000])
+            swirl_dot.set_data([x_swirl * 1000], [y_swirl * 1000])
 
-            # Get current laser source positions (arc-length-based)
-            x_src_init1, y_src_init1 = initial_path1[frame] if frame < len(initial_path1) else initial_path1[-1]
-            x_src_init2, y_src_init2 = initial_path2[frame] if frame < len(initial_path2) else initial_path2[-1]
-            x_src_opt1, y_src_opt1 = optimized_path1[frame] if frame < len(optimized_path1) else optimized_path1[-1]
-            x_src_opt2, y_src_opt2 = optimized_path2[frame] if frame < len(optimized_path2) else optimized_path2[-1]
+            # --- Save snapshot every snapshot_interval seconds ---
+            if save_snapshots and frame in snapshot_frames:
+                fname = os.path.join(snapshot_dir, f"snapshot_{frame:05d}.png")
+                fig.savefig(fname)
+            return im1, raster_laser_dot, im2, saw_dot, swirl_dot
 
-            # Convert to mm for plotting
-            x_src_init1_mm = x_src_init1 * 1000
-            y_src_init1_mm = y_src_init1 * 1000
-            x_src_init2_mm = x_src_init2 * 1000
-            y_src_init2_mm = y_src_init2 * 1000
-            x_src_opt1_mm = x_src_opt1 * 1000
-            y_src_opt1_mm = y_src_opt1 * 1000
-            x_src_opt2_mm = x_src_opt2 * 1000
-            y_src_opt2_mm = y_src_opt2 * 1000
+        update.T_raster = T_raster.copy()
+        update.T_opt = T_opt.copy()
 
-            # Update marker positions
-            source_marker_initial1.set_data([x_src_init1_mm], [y_src_init1_mm])
-            source_marker_initial2.set_data([x_src_init2_mm], [y_src_init2_mm])
-            source_marker_optimized1.set_data([x_src_opt1_mm], [y_src_opt1_mm])
-            source_marker_optimized2.set_data([x_src_opt2_mm], [y_src_opt2_mm])
-
-            # Update path lines (accumulating trajectory history)
-            current_frame = frame + 1
-            path_line_initial1.set_data(initial_path1_mm[:current_frame, 0], initial_path1_mm[:current_frame, 1])
-            path_line_initial2.set_data(initial_path2_mm[:current_frame, 0], initial_path2_mm[:current_frame, 1])
-            path_line_optimized1.set_data(optimized_path1_mm[:current_frame, 0], optimized_path1_mm[:current_frame, 1])
-            path_line_optimized2.set_data(optimized_path2_mm[:current_frame, 0], optimized_path2_mm[:current_frame, 1])
-        
-            # --- Update temperature fields for both initial and optimized ---
-            # 1. Diffusion step
-            lap_init = np.zeros_like(T_initial)
-            lap_init[1:-1, 1:-1] = ((T_initial[1:-1, 2:] - 2*T_initial[1:-1, 1:-1] + T_initial[1:-1, :-2]) / model.dx**2 +
-                                    (T_initial[2:, 1:-1] - 2*T_initial[1:-1, 1:-1] + T_initial[:-2, 1:-1]) / model.dy**2)
-            lap_opt = np.zeros_like(T_optimized)
-            lap_opt[1:-1, 1:-1] = ((T_optimized[1:-1, 2:] - 2*T_optimized[1:-1, 1:-1] + T_optimized[1:-1, :-2]) / model.dx**2 +
-                                   (T_optimized[2:, 1:-1] - 2*T_optimized[1:-1, 1:-1] + T_optimized[:-2, 1:-1]) / model.dy**2)
-
-            alpha = model.material.get('alpha', model.material['k'] / model.heat_capacity)
-            T_init_new = T_initial + model.dt * alpha * lap_init
-            T_opt_new = T_optimized + model.dt * alpha * lap_opt
-
-            # 2. Heat source step (Gaussian)
-            S_init1 = model._gaussian_source(x_src_init1, y_src_init1, initial_heat_params[0])
-            S_init2 = model._gaussian_source(x_src_init2, y_src_init2, initial_heat_params[1])
-            S_opt1 = model._gaussian_source(x_src_opt1, y_src_opt1, optimized_heat_params[0])
-            S_opt2 = model._gaussian_source(x_src_opt2, y_src_opt2, optimized_heat_params[1])
-
-            thickness = model.material.get('thickness', 0.00017)
-            rho = model.material['rho']
-            cp = model.material['cp']
-
-            T_init_new += (S_init1 + S_init2) * (model.dt / (model.dx * model.dy * thickness * rho * cp))
-            T_opt_new += (S_opt1 + S_opt2) * (model.dt / (model.dx * model.dy * thickness * rho * cp))
-
-            # 3. Boundary conditions (Dirichlet: fixed at T0)
-            T_init_new[0, :] = model.material['T0']
-            T_init_new[-1, :] = model.material['T0']
-            T_init_new[:, 0] = model.material['T0']
-            T_init_new[:, -1] = model.material['T0']
-            T_opt_new[0, :] = model.material['T0']
-            T_opt_new[-1, :] = model.material['T0']
-            T_opt_new[:, 0] = model.material['T0']
-            T_opt_new[:, -1] = model.material['T0']
-
-            # Update temperature fields
-            T_initial = T_init_new
-            T_optimized = T_opt_new
-
-            # Update temperature images
-            image_initial.set_data(T_initial)
-            image_optimized.set_data(T_optimized)
-
-            # Update color limits if needed
-            image_initial.set_clim(vmin=T_min, vmax=T_max)
-            image_optimized.set_clim(vmin=T_min, vmax=T_max)
-
-            # Update temperature info text
-            max_temp_init = np.max(T_initial)
-            max_temp_opt = np.max(T_optimized)
-            init_text = f'Max Temp: {max_temp_init:.0f}°C'
-            opt_text = f'Max Temp: {max_temp_opt:.0f}°C'
-            temp_text_initial.set_text(init_text)
-            temp_text_optimized.set_text(opt_text)
-
-            artists = [
-                image_initial, image_optimized,
-                source_marker_initial1, source_marker_initial2,
-                source_marker_optimized1, source_marker_optimized2,
-                path_line_initial1, path_line_initial2,
-                path_line_optimized1, path_line_optimized2,
-                temp_text_initial, temp_text_optimized
-            ]
-            return artists
-        
-        # Create animation with fewer frames for smoother performance
-
-        # Use the minimum length among all arc-length-resampled paths for frame count
-        frame_count = min(len(initial_path1), len(initial_path2), len(optimized_path1), len(optimized_path2))
-        # Cap at reasonable number of frames
-        if frame_count > max_frames:
-            frame_skip = max(1, frame_count // max_frames)
-            frames_to_use = list(range(0, frame_count, frame_skip))
-        else:
-            frames_to_use = list(range(frame_count))
-        
-        ani = animation.FuncAnimation(
-            fig, update, frames=frames_to_use,
-            interval=1000/fps, blit=False  # <--- set blit to False
-        )
-        
-        # --- Save frames at every 0.01s of simulated time ---
-        import os
-        save_frames = True  # Set to True to enable saving
-        frame_folder = os.path.join(os.getcwd(), "animation_frames")
-        if save_frames:
-            os.makedirs(frame_folder, exist_ok=True)
-            saved_times = set()
-            save_interval = 0.01  # seconds
-            next_save_time = 0.0
-            for idx, frame in enumerate(frames_to_use):
-                t = frame * dt  # Approximate simulation time for this frame
-                # Save frame if we've reached or passed the next interval
-                if t >= next_save_time - 1e-6:
-                    update(frame)  # Update the figure to this frame
-                    fname = os.path.join(frame_folder, f"frame_{t:.3f}s.png")
-                    plt.savefig(fname, dpi=150)
-                    saved_times.add(round(t, 3))
-                    next_save_time += save_interval
-            print(f"Saved frames at times (s): {sorted(saved_times)}")
-        
-        # Save animation if requested
-        if save_gif:
-            print(f"Saving animation to {filename}...")
-            ani.save(filename, writer='pillow', fps=fps, dpi=120)
-            print(f"Animation saved to {filename}")
-        
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.subplots_adjust(bottom=0.1, wspace=0.3)
-       
+        ani = FuncAnimation(fig, update, frames=nt, interval=1000 / fps, blit=False)
         plt.show()
-        
         return ani
 
+# ===============================
+# 4. Main Optimization Routine
+# ===============================
 def run_optimization():
     # 1. Setup material parameters for LPBF
     material_params = {
@@ -1411,7 +1069,7 @@ def run_optimization():
         'rho': 7800.0,             # Density (kg/m³)
         'cp': 500.0,               # Specific heat capacity (J/kg·K)
 
-        'thickness':  0.00017,       # Thickness (m)
+        'thickness':  0.0041,       # Thickness (m)
         'T_melt': 1500.0,          # Melting temperature (°C)
         'k': 20.0,                 # Thermal conductivity (W/m·K)
         'absorptivity': 1,       # Laser absorptivity
