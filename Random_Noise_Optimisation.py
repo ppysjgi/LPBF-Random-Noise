@@ -1,3 +1,5 @@
+from logging import config
+from networkx import omega
 import numpy as np
 import matplotlib.pyplot as plt
 import autograd.numpy as anp 
@@ -16,20 +18,50 @@ from matplotlib.animation import FuncAnimation
 # ===============================
 
 class HeatTransferModel:
-    def __init__(self, domain_size=(0.01, 0.01), grid_size=(101, 101), dt=1e-5, material_params=None):
-        # Set up simulation domain and grid
+    """
+    Heat transfer simulation model for LPBF processes.
+    
+    Simulates 2D heat conduction with moving heat sources following
+    sawtooth or swirl trajectories with optional noise.
+    """
+    
+    def __init__(self, domain_size=(0.02, 0.0025), grid_size=(401, 51), dt=1e-4, material_params=None):
+        """
+        Initialize the heat transfer model.
+        
+        Args:
+            domain_size: (Lx, Ly) domain dimensions in meters
+            grid_size: (nx, ny) grid resolution
+            dt: time step in seconds
+            material_params: dictionary of material properties
+        """
+        # Domain and grid setup
         self.Lx, self.Ly = domain_size
         self.nx, self.ny = grid_size
         self.dx = self.Lx / (self.nx - 1)
         self.dy = self.Ly / (self.ny - 1)
+        
+        # Create coordinate arrays
         self.x = anp.linspace(0, self.Lx, self.nx)
         self.y = anp.linspace(0, self.Ly, self.ny)
         self.X, self.Y = anp.meshgrid(self.x, self.y)
-        self.dt = dt
-        self.nt = None  # Number of time steps, set in simulate()
-        self.debug_counter = 0
         
-        # Set material properties
+        # Time stepping
+        self.dt = dt
+        self.nt = None  # Set during simulation
+        
+        # Material properties with defaults
+        self.material = self._set_material_properties(material_params)
+        
+        # Initialize temperature field
+        self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
+        
+        # Derived properties
+        self.heat_capacity = self.material['rho'] * self.material['cp']
+        self.thickness = self.material['thickness']
+
+    def _set_material_properties(self, material_params):
+        """Set material properties with sensible defaults for steel."""
         default_params = {
             'T0': 21.0,           # Initial temperature (°C)
             'alpha': 5e-6,        # Thermal diffusivity (m²/s)
@@ -37,172 +69,518 @@ class HeatTransferModel:
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.00021  # Plate thickness (m)
+            'thickness': 0.02, # Plate thickness (m)
+            'absorptivity': 1.0   # Absorptivity (fraction)
         }
-        self.material = default_params if material_params is None else material_params
-        self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
-        self.heat_capacity = self.material['rho'] * self.material['cp']
-        self.thickness = self.material['thickness']
+        
+        if material_params is not None:
+            default_params.update(material_params)
+        
+        return default_params
 
     def reset(self):
-        """Reset temperature field to initial value."""
+        """Reset temperature field to initial conditions."""
         self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
-    
+
     def _laplacian(self, T):
-        """Compute Laplacian of temperature field using finite differences."""
-        lap_inner = ((T[1:-1, 2:] - 2 * T[1:-1, 1:-1] + T[1:-1, :-2]) / (self.dx**2) +
-                     (T[2:, 1:-1] - 2 * T[1:-1, 1:-1] + T[:-2, 1:-1]) / (self.dy**2))
+        """
+        Compute 2D Laplacian using central finite differences.
+        
+        Args:
+            T: temperature field array
+            
+        Returns:
+            Laplacian of T with zero padding at boundaries
+        """
+        # Interior points using central differences
+        lap_x = (T[1:-1, 2:] - 2 * T[1:-1, 1:-1] + T[1:-1, :-2]) / (self.dx**2)
+        lap_y = (T[2:, 1:-1] - 2 * T[1:-1, 1:-1] + T[:-2, 1:-1]) / (self.dy**2)
+        lap_inner = lap_x + lap_y
+        
+        # Pad with zeros for boundary conditions
         lap = anp.pad(lap_inner, pad_width=((1,1),(1,1)), mode='constant', constant_values=0)
+        
         return lap
 
     def sawtooth_trajectory(self, t, params):
-        """Calculate sawtooth laser position and direction at time t."""
+        """
+        Calculate sawtooth laser position with continuous noise causing smooth path deviations.
+        Laser moves at speed v through the BASE trajectory, noise causes additional path length.
+        """
         v = params['v']
         A = params['A']
         y0 = params['y0']
         period = params['period']
         noise_sigma = params.get('noise_sigma', 0.0)
+
         max_noise = 0.00005
         noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
+
         omega = 2 * anp.pi / period
-        avg_speed_factor = anp.sqrt(1 + (2 * A * omega / anp.pi) ** 2)
-        t_scaled = t * avg_speed_factor
-        raw_x = v * t_scaled
-        k = 1000
-        x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
-        y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(omega * t_scaled))
+        x_start = 0.0015
+        x_end = self.Lx - 0.0015
+
+        avg_dy_dt = (2 * A * omega / anp.pi) * anp.sqrt(0.5)
+        if v**2 > avg_dy_dt**2:
+            v_x = anp.sqrt(v**2 - avg_dy_dt**2)
+        else:
+            v_x = v * 0.8
+            A = A * 0.5
+    
+        base_x = x_start + v_x * t
+        base_y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(omega * t))
+    
+        # FIXED: Apply CONTINUOUS noise with LARGER amplitude but STRONGER mean reversion
         if noise_sigma > 0:
-            x = x + noise_sigma * np.random.randn()
-            y = y + noise_sigma * np.random.randn()
-        tx = v
-        ty = (2 * A * omega / anp.pi) * anp.cos(omega * t_scaled)
-        norm = anp.sqrt(tx**2 + ty**2)
-        return x, y, tx / norm, ty / norm
+            if not hasattr(self, '_noise_state'):
+                self._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+        
+            dt_noise = t - self._noise_state['last_t']
+        
+            # FIXED: Balance between amplitude and mean reversion
+            theta = 200.0  # INCREASED mean reversion rate to keep near base path
+            sigma_scale = 30.0  # Moderate diffusion scale for visible but controlled noise
+        
+            if dt_noise > 0 and dt_noise < 0.1:
+                # Stronger mean reversion to keep near base trajectory
+                drift_x = -theta * self._noise_state['x'] * dt_noise
+                drift_y = -theta * self._noise_state['y'] * dt_noise
+            
+                # Add noise kicks
+                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+            
+                self._noise_state['x'] += drift_x + diffusion_x
+                self._noise_state['y'] += drift_y + diffusion_y
+            
+                # Tighter clamping to prevent excessive wandering
+                max_deviation = noise_sigma * 5.0  # Reduced from 10.0
+                self._noise_state['x'] = anp.clip(self._noise_state['x'], -max_deviation, max_deviation)
+                self._noise_state['y'] = anp.clip(self._noise_state['y'], -max_deviation, max_deviation)
+            
+            elif dt_noise <= 0:
+                pass
+            else:
+                # Reset with moderate initial value
+                self._noise_state['x'] = noise_sigma * 2.0 * np.random.randn()
+                self._noise_state['y'] = noise_sigma * 2.0 * np.random.randn()
+        
+            self._noise_state['last_t'] = t
+        
+            noise_x = self._noise_state['x']
+            noise_y = self._noise_state['y']
+        
+            x = base_x + noise_x
+            y = base_y + noise_y
+        else:
+            x = base_x
+            y = base_y
+
+        k = 1000
+        x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
+        x = max(x_start, x)
+        y = max(0, min(y, self.Ly))
+
+        tx_base = v_x
+        ty_base = (2 * A * omega / anp.pi) * anp.cos(omega * t)
+    
+        norm = anp.sqrt(tx_base**2 + ty_base**2)
+        tx = tx_base / norm if norm > 0 else 1.0
+        ty = ty_base / norm if norm > 0 else 0.0
+
+        return x, y, tx, ty
 
     def swirl_trajectory(self, t, params):
-        """Calculate swirl laser position and direction at time t."""
-        v = params['v']
+        """
+        Calculate swirl laser position with continuous noise causing smooth path deviations.
+        Laser moves at speed v through the BASE trajectory, noise causes additional path length.
+        """
+        v = params['v']  # Speed through the BASE swirl path
         A = params['A']
         y0 = params['y0']
         fr = params['fr']
-        om = 2 * anp.pi * fr
         noise_sigma = params.get('noise_sigma', 0.0)
+
+        # Limit noise to reasonable bounds
         max_noise = 0.00005
         noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
-        avg_speed_factor = anp.sqrt(1 + (A * om / v) ** 2)
-        t_scaled = t * avg_speed_factor
-        raw_x = v * t_scaled + A * anp.sin(om * t_scaled)
-        k = 1000
-        x = raw_x - (raw_x - (self.Lx - 0.0005)) * (1 / (1 + anp.exp(-k * (raw_x - (self.Lx - 0.0005)))))
-        y = y0 + A * anp.cos(om * t_scaled)
+
+        om = 2 * anp.pi * fr
+        x_start = 0.0015
+        x_end = self.Lx - 0.0015
+
+        # Calculate base velocity
+        A_om = A * om
+        if v**2 > (A_om**2) / 2:
+            v_base = anp.sqrt(v**2 - (A_om**2) / 2)
+        else:
+            v_base = v * 0.7
+            A = A * 0.5
+            A_om = A * om
+    
+        # Calculate base trajectory position
+        base_x = x_start + v_base * t + A * anp.sin(om * t)
+        base_y = y0 + A * anp.cos(om * t)
+    
+        # FIXED: Apply CONTINUOUS noise with MUCH LARGER amplitude
         if noise_sigma > 0:
-            x = x + noise_sigma * np.random.randn()
-            y = y + noise_sigma * np.random.randn()
-        tx = v + A * om * anp.cos(om * t_scaled)
-        ty = -A * om * anp.sin(om * t_scaled)
-        norm = anp.sqrt(tx**2 + ty**2)
-        return x, y, tx / norm, ty / norm
-
-    def compute_temperature_gradients(self, T=None):
-        """Compute spatial gradients and gradient magnitude of temperature field."""
-        if T is None:
-            T = self.T
+            # Initialize noise state if not exists
+            if not hasattr(self, '_noise_state_swirl'):
+                self._noise_state_swirl = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+        
+            # Time step since last update
+            dt_noise = t - self._noise_state_swirl['last_t']
+        
+            # FIXED: Much more aggressive parameters
+            theta = 200.0  # VERY REDUCED mean reversion rate
+            sigma_scale = 30.0  # MUCH LARGER diffusion scale
+        
+            if dt_noise > 0 and dt_noise < 0.1:
+                # Update noise state with Ornstein-Uhlenbeck process
+                drift_x = -theta * self._noise_state_swirl['x'] * dt_noise
+                drift_y = -theta * self._noise_state_swirl['y'] * dt_noise
             
-        grad_x_left = (T[:, 1:2] - T[:, 0:1]) / self.dx
-        grad_x_interior = (T[:, 2:] - T[:, :-2]) / (2 * self.dx)
-        grad_x_right = (T[:, -1:] - T[:, -2:-1]) / self.dx
-        grad_x = anp.concatenate([grad_x_left, grad_x_interior, grad_x_right], axis=1)
+                # MUCH LARGER diffusion for visible amplitude
+                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+            
+                self._noise_state_swirl['x'] += drift_x + diffusion_x
+                self._noise_state_swirl['y'] += drift_y + diffusion_y
+            
+                # Allow much larger deviations
+                max_deviation = noise_sigma * 5.0
+                self._noise_state_swirl['x'] = anp.clip(self._noise_state_swirl['x'], -max_deviation, max_deviation)
+                self._noise_state_swirl['y'] = anp.clip(self._noise_state_swirl['y'], -max_deviation, max_deviation)
+            
+            elif dt_noise <= 0:
+                pass
+            else:
+                # Large time jump - reset with much larger initial value
+                self._noise_state_swirl['x'] = noise_sigma * 5.0 * np.random.randn()
+                self._noise_state_swirl['y'] = noise_sigma * 5.0 * np.random.randn()
+        
+            self._noise_state_swirl['last_t'] = t
+        
+            noise_x = self._noise_state_swirl['x']
+            noise_y = self._noise_state_swirl['y']
+        
+            x = base_x + noise_x
+            y = base_y + noise_y
+        else:
+            x = base_x
+            y = base_y
 
-        grad_y_top = (T[1:2, :] - T[0:1, :]) / self.dy
-        grad_y_interior = (T[2:, :] - T[:-2, :]) / (2 * self.dy)
-        grad_y_bottom = (T[-1:, :] - T[-2:-1, :]) / self.dy
-        grad_y = anp.concatenate([grad_y_top, grad_y_interior, grad_y_bottom], axis=0)
+        # Apply boundary constraints
+        k = 1000
+        x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
+        x = max(x_start, x)
+        y = max(0, min(y, self.Ly))
 
-        grad_mag = anp.sqrt(grad_x**2 + grad_y**2)
-        return grad_x, grad_y, grad_mag
+        # Direction vector from base trajectory
+        tx_base = v_base + A * om * anp.cos(om * t)
+        ty_base = -A * om * anp.sin(om * t)
+    
+        # Normalize to unit vector
+        norm = anp.sqrt(tx_base**2 + ty_base**2)
+        tx = tx_base / norm if norm > 0 else 1.0
+        ty = ty_base / norm if norm > 0 else 0.0
+
+        return x, y, tx, ty
+
+    def straight_trajectory(self, t, params):
+        """
+        Calculate straight laser position with continuous noise causing smooth path deviations.
+        Laser moves at speed v horizontally, noise causes wandering but smooth path.
+        """
+        v = params['v']  # Speed through the BASE straight path
+        y0 = params['y0']
+        noise_sigma = params.get('noise_sigma', 0.0)
+
+        # Limit noise to reasonable bounds
+        max_noise = 0.00005
+        noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
+
+        x_start = 0.0015
+        x_end = self.Lx - 0.0015
+
+        # Base velocity is simply v in x-direction
+        base_x = x_start + v * t
+        base_y = y0
+    
+        # FIXED: Apply CONTINUOUS noise with MUCH LARGER amplitude
+        if noise_sigma > 0:
+            # Initialize noise state if not exists
+            if not hasattr(self, '_noise_state_straight'):
+                self._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+        
+            # Time step since last update
+            dt_noise = t - self._noise_state_straight['last_t']
+        
+            # FIXED: Much more aggressive parameters
+            theta = 200.0  # VERY REDUCED mean reversion rate
+            sigma_scale = 30.0  # MUCH LARGER diffusion scale
+        
+            if dt_noise > 0 and dt_noise < 0.1:
+                # Update noise state with Ornstein-Uhlenbeck process
+                drift_x = -theta * self._noise_state_straight['x'] * dt_noise
+                drift_y = -theta * self._noise_state_straight['y'] * dt_noise
+            
+                # MUCH LARGER diffusion for visible amplitude
+                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
+            
+                self._noise_state_straight['x'] += drift_x + diffusion_x
+                self._noise_state_straight['y'] += drift_y + diffusion_y
+            
+                # Allow much larger deviations
+                max_deviation = noise_sigma * 5.0
+                self._noise_state_straight['x'] = anp.clip(self._noise_state_straight['x'], -max_deviation, max_deviation)
+                self._noise_state_straight['y'] = anp.clip(self._noise_state_straight['y'], -max_deviation, max_deviation)
+            
+            elif dt_noise <= 0:
+                pass
+            else:
+                # Large time jump - reset with much larger initial value
+                self._noise_state_straight['x'] = noise_sigma * 5.0 * np.random.randn()
+                self._noise_state_straight['y'] = noise_sigma * 5.0 * np.random.randn()
+        
+            self._noise_state_straight['last_t'] = t
+        
+            noise_x = self._noise_state_straight['x']
+            noise_y = self._noise_state_straight['y']
+        
+            x = base_x + noise_x
+            y = base_y + noise_y
+        else:
+            x = base_x
+            y = base_y
+
+        # Apply boundary constraints
+        k = 1000
+        x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
+        x = max(x_start, x)
+        y = max(0, min(y, self.Ly))
+
+        # Direction vector is simply horizontal
+        tx, ty = 1.0, 0.0
+
+        return x, y, tx, ty
+    
+    def reset(self):
+        """Reset temperature field to initial conditions and clear noise states."""
+        self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
+    
+        # FIXED: Properly reset ALL noise states for all trajectory types
+        # Clear noise state for sawtooth
+        if hasattr(self, '_noise_state'):
+            self._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+    
+        # Clear noise state for swirl  
+        if hasattr(self, '_noise_state_swirl'):
+            self._noise_state_swirl = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+    
+    #    Clear noise state for straight
+        if hasattr(self, '_noise_state_straight'):
+            self._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
 
     def _gaussian_source(self, x_src, y_src, heat_params):
-        """Calculate Gaussian heat source centered at (x_src, y_src)."""
+        """
+        Calculate Gaussian heat source distribution centered at (x_src, y_src).
+        
+        Args:
+            x_src, y_src: source center coordinates
+            heat_params: dictionary with 'Q' (power) and 'r0' or 'sigma_x'/'sigma_y'
+            
+        Returns:
+            Heat source distribution array
+        """
         power = heat_params.get('Q', 200.0)
+        
+        # Determine Gaussian width parameters
         if 'r0' in heat_params:
-            sigma_x = heat_params['r0'] / 2.0
-            sigma_y = heat_params['r0'] / 2.0
+            sigma_x = sigma_y = heat_params['r0'] / np.sqrt(2)
         else:
             sigma_x = heat_params.get('sigma_x', 1.5e-3)
             sigma_y = heat_params.get('sigma_y', 1.5e-3)
-        absorbed_power = power * self.material['absorptivity']
+        
+        # Apply absorptivity if available
+        absorbed_power = power * self.material.get('absorptivity', 1.0)
+        
+        # Calculate Gaussian distribution
         G = np.exp(-(((self.X - x_src)**2) / (2 * sigma_x**2) +
                      ((self.Y - y_src)**2) / (2 * sigma_y**2)))
+        
         return G * absorbed_power
+
+    def _apply_boundary_conditions(self, T):
+        """Apply convective boundary conditions instead of fixed temperature."""
+        # Convective heat transfer coefficient (W/m²·K)
+        h = 10.0  # Typical value for air convection
+        T_amb = self.material['T0']  # Ambient temperature
+    
+        # Calculate convective cooling rate
+        dt_factor = self.dt * h / (self.material['rho'] * self.material['cp'] * self.thickness)
+    
+        # Apply convective cooling (heat loss proportional to temperature difference)
+        # Top boundary
+        T[0, :] = T[0, :] - dt_factor * np.maximum(0, T[0, :] - T_amb)
+        # Bottom boundary
+        T[-1, :] = T[-1, :] - dt_factor * np.maximum(0, T[-1, :] - T_amb)
+        # Left boundary
+        T[:, 0] = T[:, 0] - dt_factor * np.maximum(0, T[:, 0] - T_amb)
+        # Right boundary
+        T[:, -1] = T[:, -1] - dt_factor * np.maximum(0, T[:, -1] - T_amb)
+    
+        # Ensure temperature doesn't go below ambient
+        T = np.maximum(T, T_amb)
+    
+        return T
 
     def simulate(self, parameters, start_x=0.0, end_x=None, use_gaussian=True, verbose=False):
         """
-        Run heat transfer simulation for given laser and heat source parameters.
-        Returns final temperature field.
+        Run heat transfer simulation with moving laser sources.
+    
+        Args:
+            parameters: tuple of (laser_params, heat_params)
+            start_x, end_x: x-range for simulation (meters)
+            use_gaussian: whether to use Gaussian heat source
+            verbose: print simulation progress
+        
+        Returns:
+            Final temperature field
         """
         laser_params, heat_params = parameters
-        sawtooth_params, swirl_params = laser_params
-        
+    
+        # Reset to initial conditions
         self.reset()
+    
+        # Set simulation domain
         if end_x is None:
             end_x = self.Lx
-
-        fixed_nt = 3000  # Number of time steps
-        self.nt = fixed_nt
-
-        # Use thermal diffusivity from material properties
+    
+        # Fixed number of time steps for consistency
+        self.nt = 6000
+    
+        # Get thermal diffusivity
         if 'alpha' not in self.material and 'k' in self.material:
             alpha = self.material['k'] / (self.material['rho'] * self.material['cp'])
         else:
             alpha = self.material['alpha']
-        
+    
+        # Initialize gradient tracking arrays
+        max_gradients = []
+        mean_gradients = []
+    
+        # Main simulation loop
         T = self.T.copy()
+    
+        # In the simulate method, add position tracking in the loop:
         for n in range(self.nt):
             t = n * self.dt
-
-            # Get laser positions and directions
-            x1, y1, tx1, ty1 = self.sawtooth_trajectory(t, sawtooth_params)
-            x2, y2, tx2, ty2 = self.swirl_trajectory(t, swirl_params)
+            S_total = 0
+    
+            # Handle single or dual laser sources
+            if isinstance(laser_params, tuple):
+                # Multiple laser sources
+                for i, laser in enumerate(laser_params):
+                    x, y, _, _ = self._get_laser_position(t, laser)
             
-            # Calculate heat source from both lasers
-            S1 = self._gaussian_source(x1, y1, heat_params[0])
-            S2 = self._gaussian_source(x2, y2, heat_params[1])
-            S_total = S1 + S2
+                    # Track positions if requested
+                    if hasattr(self, '_track_laser_positions') and self._track_laser_positions:
+                        laser_type = laser['type']
+                        # Only track if within scan bounds
+                        x_start, x_end = 0.0015, self.Lx - 0.0015
+                        if x < (x_end - 1e-6):
+                            if not self._laser_position_history[laser_type]:
+                                self._laser_position_history[laser_type].append(([], []))
+                            self._laser_position_history[laser_type][i][0].append(x * 1000)
+                            self._laser_position_history[laser_type][i][1].append(y * 1000)
             
-            # Update temperature field using explicit finite difference
-            lap = self._laplacian(T)
-            T_diff = T + self.dt * alpha * lap 
-            source_increment = self.dt * S_total / (self.dx * self.dy * self.thickness * self.material['rho'] * self.material['cp'])
-            T_new = T_diff + source_increment
-            
-            # Apply fixed boundary conditions
-            T_new[0, :] = self.material['T0']
-            T_new[-1, :] = self.material['T0']
-            T_new[:, 0] = self.material['T0']
-            T_new[:, -1] = self.material['T0']
-            
-            T = T_new
-              
+                    S = self._gaussian_source(x, y, heat_params[i])
+                    S_total += S
+            else:
+                # Single laser source
+                x, y, _, _ = self._get_laser_position(t, laser_params)
         
+                # Track positions if requested
+                if hasattr(self, '_track_laser_positions') and self._track_laser_positions:
+                    laser_type = laser_params['type']
+                    x_start, x_end = 0.0015, self.Lx - 0.0015
+                    if x < (x_end - 1e-6):
+                        if not self._laser_position_history[laser_type]:
+                            self._laser_position_history[laser_type].append(([], []))
+                        self._laser_position_history[laser_type][0][0].append(x * 1000)
+                        self._laser_position_history[laser_type][0][1].append(y * 1000)
+        
+                S_total = self._gaussian_source(x, y, heat_params)
+        
+            # Solve heat equation: ∂T/∂t = α∇²T + S/(ρcp)
+            lap = self._laplacian(T)
+            T_diff = T + self.dt * alpha * lap
+
+            # Add heat source term
+            volume_factor = self.dx * self.dy * self.thickness
+            source_increment = (self.dt * S_total) / (volume_factor * self.heat_capacity)
+            T_new = T_diff + source_increment
+        
+            # Apply boundary conditions
+            T = self._apply_boundary_conditions(T_new)
+        
+            # Compute and store gradients at each time step
+            _, _, grad_mag = self.compute_temperature_gradients(T)
+            max_gradients.append(np.max(grad_mag))
+            mean_gradients.append(np.mean(grad_mag))
+    
+        # Store temporal gradient statistics
+        self.temporal_grad_stats = {
+            'max_over_time': np.max(max_gradients),
+            'mean_over_time': np.mean(mean_gradients),
+            'max_gradients': max_gradients,
+            'mean_gradients': mean_gradients
+        }
+    
         self.T = T
         return self.T
 
+    def _get_laser_position(self, t, laser_params):
+        """Get laser position based on trajectory type."""
+        if laser_params['type'] == 'sawtooth':
+            return self.sawtooth_trajectory(t, laser_params['params'])
+        elif laser_params['type'] == 'swirl':
+            return self.swirl_trajectory(t, laser_params['params'])
+        elif laser_params['type'] == 'straight':
+            return self.straight_trajectory(t, laser_params['params'])
+        else:
+            raise ValueError(f"Unknown trajectory type: {laser_params['type']}")
+
     def compute_temperature_gradients(self, T=None):
-        """Compute spatial gradients and gradient magnitude of temperature field."""
+        """
+        Compute spatial temperature gradients using central differences.
+        
+        Args:
+            T: temperature field (uses self.T if None)
+            
+        Returns:
+            grad_x, grad_y, grad_mag: gradient components and magnitude
+        """
         if T is None:
             T = self.T
-            
+        
+        # X-gradient with boundary handling
         grad_x_left = (T[:, 1:2] - T[:, 0:1]) / self.dx
         grad_x_interior = (T[:, 2:] - T[:, :-2]) / (2 * self.dx)
         grad_x_right = (T[:, -1:] - T[:, -2:-1]) / self.dx
         grad_x = anp.concatenate([grad_x_left, grad_x_interior, grad_x_right], axis=1)
-
+        
+        # Y-gradient with boundary handling
         grad_y_top = (T[1:2, :] - T[0:1, :]) / self.dy
         grad_y_interior = (T[2:, :] - T[:-2, :]) / (2 * self.dy)
         grad_y_bottom = (T[-1:, :] - T[-2:-1, :]) / self.dy
         grad_y = anp.concatenate([grad_y_top, grad_y_interior, grad_y_bottom], axis=0)
-
+        
+        # Gradient magnitude
         grad_mag = anp.sqrt(grad_x**2 + grad_y**2)
+        
         return grad_x, grad_y, grad_mag
 
 # ===============================
@@ -210,18 +588,47 @@ class HeatTransferModel:
 # ===============================
     
 class TrajectoryOptimizer:
+    """
+    Optimization class for laser trajectory parameters in LPBF processes.
+    
+    Supports both single and dual laser configurations with various
+    objective functions and constraint handling.
+    """
+    
     def __init__(self, model, initial_params=None, bounds=None, x_range=(0.0, 0.01)):
-        # Store model and optimization settings
+        """
+        Initialize the trajectory optimizer.
+        
+        Args:
+            model: HeatTransferModel instance
+            initial_params: dictionary of initial parameter values
+            bounds: dictionary of parameter bounds (min, max)
+            x_range: tuple of (x_start, x_end) for scan region
+        """
         self.model = model
-        self.initial_params = initial_params
-        self.bounds = bounds
+        self.initial_params = initial_params or {}
+        self.bounds = bounds or {}
         self.x_range = x_range
+        
+        # Extract parameter names for optimization (exclude fixed y0 parameters)
+        self.param_names = self._get_optimization_parameters()
+        
+    def _get_optimization_parameters(self):
+        """Extract parameters to be optimized, excluding fixed y0 and r0 values."""
+        fixed_keys = {
+            'sawtooth_y0', 'swirl_y0', 'straight_y0',
+            'sawtooth2_y0', 'swirl2_y0', 'straight2_y0',
+            'sawtooth_r0', 'swirl_r0', 'straight_r0',  # ADDED: exclude r0 parameters
+            'sawtooth2_r0', 'swirl2_r0', 'straight2_r0'  # ADDED: exclude r0 for dual lasers
+        }
 
-        # Select parameters to optimize (exclude fixed y0)
-        self.param_names = [k for k in initial_params.keys() if k not in ['sawtooth_y0', 'swirl_y0']]
+        param_names = [k for k in self.initial_params.keys() if k not in fixed_keys]
+
         # Always include noise_sigma if present in bounds
-        if self.bounds and 'noise_sigma' in self.bounds and 'noise_sigma' not in self.param_names:
-            self.param_names.append('noise_sigma')
+        if self.bounds and 'noise_sigma' in self.bounds and 'noise_sigma' not in param_names:
+            param_names.append('noise_sigma')
+    
+        return param_names
 
     def parameters_to_array(self, params_dict):
         """Convert parameter dictionary to flat array for optimization."""
@@ -234,111 +641,290 @@ class TrajectoryOptimizer:
     def unpack_parameters(self, params_array):
         """
         Convert flat parameter array to structured laser and heat source parameters.
-        Returns (laser_params, heat_params).
+        
+        Args:
+            params_array: flat array of optimization parameters
+            
+        Returns:
+            tuple: (laser_params, heat_params) for simulation
         """
         params_dict = self.array_to_parameters(params_array)
         noise_sigma = params_dict.get('noise_sigma', self.initial_params.get('noise_sigma', 0.0))
-        sawtooth_params = {
-            'v': params_dict['sawtooth_v'],
-            'A': params_dict['sawtooth_A'],
-            'y0': self.initial_params['sawtooth_y0'],
-            'period': params_dict['sawtooth_period'],
-            'noise_sigma': noise_sigma
-        }
-        swirl_params = {
-            'v': params_dict['swirl_v'],
-            'A': params_dict['swirl_A'],
-            'y0': self.initial_params['swirl_y0'],
-            'fr': params_dict['swirl_fr'],
-            'noise_sigma': noise_sigma
-        }
-        heat_params = (
-            {'Q': params_dict['sawtooth_Q'], 'r0': params_dict['sawtooth_r0']},
-            {'Q': params_dict['swirl_Q'], 'r0': params_dict['swirl_r0']}
-        )
-        laser_params = (sawtooth_params, swirl_params)
+
+        # Check if dual source configuration
+        if self._is_dual_source(params_dict):
+            return self._unpack_dual_source(params_dict, noise_sigma)
+        else:
+            return self._unpack_single_source(params_dict, noise_sigma)
+    
+    def _is_dual_source(self, params_dict):
+        """Check if parameters define dual source configuration."""
+        dual_keys = {'sawtooth2_v', 'swirl2_v', 'straight2_v'}
+        return any(key in params_dict for key in dual_keys)
+    
+    def _unpack_dual_source(self, params_dict, noise_sigma):
+        """Unpack parameters for dual laser configuration."""
+        # Source 1
+        laser1, heat1 = self._create_laser_config(params_dict, 1, noise_sigma)
+        
+        # Source 2  
+        laser2, heat2 = self._create_laser_config(params_dict, 2, noise_sigma)
+        
+        return (laser1, laser2), (heat1, heat2)
+    
+    def _unpack_single_source(self, params_dict, noise_sigma):
+        """Unpack parameters for single laser configuration."""
+        laser_params, heat_params = self._create_laser_config(params_dict, 1, noise_sigma)
         return laser_params, heat_params
     
-    def objective_function(self, params_array):
+    def _create_laser_config(self, params_dict, source_num, noise_sigma):
         """
-        Objective: minimize sum of squared temperature gradients (smoothness).
+        Create laser configuration for specified source number.
+        
+        Args:
+            params_dict: parameter dictionary
+            source_num: 1 for primary source, 2 for secondary
+            noise_sigma: noise level
+            
+        Returns:
+            tuple: (laser_config, heat_config)
         """
-        # Penalize extreme parameter values
+        suffix = '' if source_num == 1 else '2'
+        
+        # Check trajectory type for this source
+        if f'straight{suffix}_v' in params_dict:
+            return self._create_straight_config(params_dict, suffix, noise_sigma)
+        elif f'sawtooth{suffix}_v' in params_dict:
+            return self._create_sawtooth_config(params_dict, suffix, noise_sigma)
+        elif f'swirl{suffix}_v' in params_dict:
+            return self._create_swirl_config(params_dict, suffix, noise_sigma)
+        else:
+            raise ValueError(f"No valid trajectory parameters found for source {source_num}")
+
+    def _create_straight_config(self, params_dict, suffix, noise_sigma):
+        """Create straight trajectory configuration."""
+        prefix = f'straight{suffix}'
+    
+        laser_config = {
+            'type': 'straight',
+            'params': {
+                'v': params_dict[f'{prefix}_v'],
+                'y0': self.initial_params.get(f'{prefix}_y0', 0.0005),
+                'noise_sigma': noise_sigma
+            }
+        }
+    
+        heat_config = {
+            'Q': params_dict[f'{prefix}_Q'],
+            'r0': self.initial_params.get(f'{prefix}_r0', 4e-5)
+        }
+    
+        return laser_config, heat_config
+    
+    def _create_sawtooth_config(self, params_dict, suffix, noise_sigma):
+        """Create sawtooth trajectory configuration."""
+        prefix = f'sawtooth{suffix}'
+        
+        laser_config = {
+            'type': 'sawtooth',
+            'params': {
+                'v': params_dict[f'{prefix}_v'],
+                'A': params_dict[f'{prefix}_A'],
+                'y0': self.initial_params.get(f'{prefix}_y0', 0.0005),
+                'period': params_dict[f'{prefix}_period'],
+                'noise_sigma': noise_sigma
+            }
+        }
+        
+        heat_config = {
+            'Q': params_dict[f'{prefix}_Q'],
+            'r0': self.initial_params.get(f'{prefix}_r0', 4e-5)
+        }
+        
+        return laser_config, heat_config
+    
+    def _create_swirl_config(self, params_dict, suffix, noise_sigma):
+        """Create swirl trajectory configuration."""
+        prefix = f'swirl{suffix}'
+        
+        laser_config = {
+            'type': 'swirl',
+            'params': {
+                'v': params_dict[f'{prefix}_v'],
+                'A': params_dict[f'{prefix}_A'],
+                'y0': self.initial_params.get(f'{prefix}_y0', 0.0005),
+                'fr': params_dict[f'{prefix}_fr'],
+                'noise_sigma': noise_sigma
+            }
+        }
+        
+        heat_config = {
+            'Q': params_dict[f'{prefix}_Q'],
+            'r0': self.initial_params.get(f'{prefix}_r0', 4e-5)
+        }
+        
+        return laser_config, heat_config
+
+    # ===============================
+    # Objective Functions
+    # ===============================
+    
+    def _validate_parameters(self, params_array):
+        """Check for extreme parameter values that would cause numerical issues."""
         for i, name in enumerate(self.param_names):
             if anp.abs(params_array[i]) > 1e6:
                 print(f"Warning: Parameter {name} has extreme value: {params_array[i]}")
-                return 1e10
+                return False
+        return True
+    
+    def _get_heat_source_type(self, heat_params):
+        """Determine if heat source uses Gaussian distribution."""
+        if isinstance(heat_params, (list, tuple)):
+            return 'r0' in heat_params[0]
+        else:
+            return 'r0' in heat_params
+
+    def objective_function(self, params_array):
+        """
+        Standard objective: minimize sum of squared temperature gradients (smoothness).
+        
+        Args:
+            params_array: flat array of optimization parameters
+            
+        Returns:
+            float: objective function value
+        """
+        if not self._validate_parameters(params_array):
+            return 1e10
+            
         laser_params, heat_params = self.unpack_parameters(params_array)
-        use_gaussian = 'r0' in heat_params[0]
-        T = self.model.simulate((laser_params, heat_params), 
-                                start_x=self.x_range[0], 
-                                end_x=self.x_range[1],
-                                use_gaussian=use_gaussian)
+        use_gaussian = self._get_heat_source_type(heat_params)
+        
+        T = self.model.simulate(
+            (laser_params, heat_params),
+            start_x=self.x_range[0],
+            end_x=self.x_range[1],
+            use_gaussian=use_gaussian
+        )
+        
         _, _, grad_mag = self.model.compute_temperature_gradients(T)
         cost = anp.sum(grad_mag**2) / (self.model.nx * self.model.ny)
+        
         return cost
 
     def objective_max_gradient(self, params_array):
         """
         Objective: minimize maximum temperature gradient (reduce hot spots).
         """
+        if not self._validate_parameters(params_array):
+            return 1e10
+            
         laser_params, heat_params = self.unpack_parameters(params_array)
-        use_gaussian = 'r0' in heat_params[0]
-        T = self.model.simulate((laser_params, heat_params), 
-                                start_x=self.x_range[0], 
-                                end_x=self.x_range[1],
-                                use_gaussian=use_gaussian)
+        use_gaussian = self._get_heat_source_type(heat_params)
+        
+        T = self.model.simulate(
+            (laser_params, heat_params),
+            start_x=self.x_range[0],
+            end_x=self.x_range[1],
+            use_gaussian=use_gaussian
+        )
+        
         _, _, grad_mag = self.model.compute_temperature_gradients(T)
-        cost = anp.max(grad_mag)
-        return cost
+        return anp.max(grad_mag)
 
     def objective_path_focused(self, params_array):
         """
         Objective: minimize gradients along laser paths only.
         """
+        if not self._validate_parameters(params_array):
+            return 1e10
+            
         laser_params, heat_params = self.unpack_parameters(params_array)
-        sawtooth_params, swirl_params = laser_params
-        use_gaussian = 'r0' in heat_params[0]
-        T = self.model.simulate((laser_params, heat_params), 
-                                start_x=self.x_range[0], 
-                                end_x=self.x_range[1],
-                                use_gaussian=use_gaussian)
+        use_gaussian = self._get_heat_source_type(heat_params)
+        
+        T = self.model.simulate(
+            (laser_params, heat_params),
+            start_x=self.x_range[0],
+            end_x=self.x_range[1],
+            use_gaussian=use_gaussian
+        )
+        
         _, _, grad_mag = self.model.compute_temperature_gradients(T)
+        
+        # Sample points along laser paths
+        path_gradients = self._sample_path_gradients(laser_params, grad_mag)
+        
+        return anp.mean(anp.array(path_gradients))
+    
+    def _sample_path_gradients(self, laser_params, grad_mag):
+        """Sample temperature gradients along laser paths."""
         times = anp.linspace(0, self.model.nt * self.model.dt, 50)
         path_points = []
-        for t in times:
-            x1, y1, _, _ = self.model.sawtooth_trajectory(t, sawtooth_params)
-            x2, y2, _, _ = self.model.swirl_trajectory(t, swirl_params)
-            path_points.append((x1, y1))
-            path_points.append((x2, y2))
+        
+        # Handle single or dual laser configuration
+        if isinstance(laser_params, tuple):
+            for laser in laser_params:
+                for t in times:
+                    x, y, _, _ = self._get_trajectory_point(t, laser)
+                    path_points.append((x, y))
+        else:
+            for t in times:
+                x, y, _, _ = self._get_trajectory_point(t, laser_params)
+                path_points.append((x, y))
+        
+        # Extract gradients at path points
         path_gradients = []
         dx, dy = self.model.dx, self.model.dy
+        
         for x, y in path_points:
             i = int(anp.clip(y / dy, 0, self.model.ny - 1))
             j = int(anp.clip(x / dx, 0, self.model.nx - 1))
             path_gradients.append(grad_mag[i, j])
-        cost = anp.mean(anp.array(path_gradients))
-        return cost
+            
+        return path_gradients
+    
+    def _get_trajectory_point(self, t, laser_config):
+        """Get trajectory point for given time and laser configuration."""
+        if laser_config['type'] == 'sawtooth':
+            return self.model.sawtooth_trajectory(t, laser_config['params'])
+        elif laser_config['type'] == 'swirl':
+            return self.model.swirl_trajectory(t, laser_config['params'])
+        elif laser_config['type'] == 'straight':
+            return self.model.straight_trajectory(t, laser_config['params'])
+        else:
+            raise ValueError(f"Unknown trajectory type: {laser_config['type']}")
 
     def objective_thermal_uniformity(self, params_array):
         """
         Objective: promote uniform melt pool temperature and minimize gradients.
         """
+        if not self._validate_parameters(params_array):
+            return 1e10
+            
         laser_params, heat_params = self.unpack_parameters(params_array)
-        use_gaussian = 'r0' in heat_params[0]
-        T = self.model.simulate((laser_params, heat_params), 
-                                start_x=self.x_range[0], 
-                                end_x=self.x_range[1],
-                                use_gaussian=use_gaussian)
+        use_gaussian = self._get_heat_source_type(heat_params)
+        
+        T = self.model.simulate(
+            (laser_params, heat_params),
+            start_x=self.x_range[0],
+            end_x=self.x_range[1],
+            use_gaussian=use_gaussian
+        )
+        
         _, _, grad_mag = self.model.compute_temperature_gradients(T)
         grad_cost = anp.mean(grad_mag**2)
+        
+        # Calculate temperature variance in melt pool
         melt_temp = self.model.material['T_melt']
         melt_mask = T > melt_temp
+        
         if anp.sum(melt_mask) > 0:
             T_melt = T[melt_mask]
             T_variance = anp.var(T_melt)
         else:
             T_variance = 0.0
+        
+        # Weighted combination of gradient and temperature variance
         cost = 0.7 * grad_cost + 0.3 * T_variance
         return cost
 
@@ -346,152 +932,207 @@ class TrajectoryOptimizer:
         """
         Objective: minimize maximum temperature difference in melt pool.
         """
+        if not self._validate_parameters(params_array):
+            return 1e10
+            
         laser_params, heat_params = self.unpack_parameters(params_array)
-        use_gaussian = 'r0' in heat_params[0]
-        T = self.model.simulate((laser_params, heat_params), 
-                            start_x=self.x_range[0], 
-                            end_x=self.x_range[1],
-                            use_gaussian=use_gaussian)
+        use_gaussian = self._get_heat_source_type(heat_params)
+        
+        T = self.model.simulate(
+            (laser_params, heat_params),
+            start_x=self.x_range[0],
+            end_x=self.x_range[1],
+            use_gaussian=use_gaussian
+        )
+        
         melt_temp = self.model.material['T_melt']
         melt_mask = T > melt_temp
+        
         if anp.sum(melt_mask) > 0:
             T_melt = T[melt_mask]
             max_temp_diff = anp.max(T_melt) - anp.min(T_melt)
         else:
-            max_temp_diff = 1000.0  
+            max_temp_diff = 1000.0  # Penalty if no melt pool
+            
         return max_temp_diff
+
+    # ===============================
+    # Constraint Functions
+    # ===============================
     
     def get_inequality_constraints(self):
         """
         Create list of inequality constraint functions for optimizer.
         Each constraint must be g(x) <= 0.
+        
+        Returns:
+            list: constraint functions
         """
-        inequality_constraints = []
-        # Example constraints (distance, path bounds, energy density, parameter bounds)
-        def min_distance_constraint(x):
-            laser_params, _ = self.unpack_parameters(x)
-            min_distance = self._calculate_min_laser_distance(laser_params)
-            min_allowed_distance = 0.0005
-            return min_allowed_distance - min_distance
-        def sawtooth_max_y_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            sawtooth_y_max = params_dict['sawtooth_y0'] + params_dict['sawtooth_A']
-            return sawtooth_y_max - self.model.Ly
-        def sawtooth_min_y_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            sawtooth_y_min = params_dict['sawtooth_y0'] - params_dict['sawtooth_A']
-            return -sawtooth_y_min
-        def swirl_max_y_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            swirl_y_max = params_dict['swirl_y0'] + params_dict['swirl_A']
-            return swirl_y_max - self.model.Ly
-        def swirl_min_y_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            swirl_y_min = params_dict['swirl_y0'] - params_dict['swirl_A']
-            return -swirl_y_min
-        # Energy density constraints (example, not enforced by default)
-        def max_energy_sawtooth_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            Q = params_dict['Q']
-            energy_density = Q / (params_dict['sawtooth_v'] * 0.0002)
-            max_energy_density = 100.0
-            return energy_density - max_energy_density
-        def min_energy_sawtooth_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            Q = params_dict['Q']
-            energy_density = Q / (params_dict['sawtooth_v'] * 0.0002)
-            min_energy_density = 10.0
-            return min_energy_density - energy_density
-        def max_energy_swirl_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            Q = params_dict['Q']
-            energy_density = Q / (params_dict['swirl_v'] * 0.0002)
-            max_energy_density = 100.0
-            return energy_density - max_energy_density
-        def min_energy_swirl_constraint(x):
-            params_dict = self.array_to_parameters(x)
-            Q = params_dict['Q']
-            energy_density = Q / (params_dict['swirl_v'] * 0.0002)
-            min_energy_density = 10.0
-            return min_energy_density - energy_density
-        # Add parameter bounds as constraints
-        bound_constraints = []
+        constraints = []
+        
+        # Add parameter bound constraints
+        constraints.extend(self._create_bound_constraints())
+        
+        # Add trajectory-specific constraints (optional)
+        # constraints.extend(self._create_trajectory_constraints())
+        
+        return constraints
+    
+    def _create_bound_constraints(self):
+        """Create parameter bound constraints."""
+        constraints = []
+        
         for i, name in enumerate(self.param_names):
             if name in self.bounds:
                 lb, ub = self.bounds[name]
+                
+                # Lower bound constraint: lb - x[i] <= 0
                 def make_lb_constraint(idx, bound):
                     return lambda x: bound - x[idx]
+                
+                # Upper bound constraint: x[i] - ub <= 0
                 def make_ub_constraint(idx, bound):
                     return lambda x: x[idx] - bound
-                bound_constraints.append(make_lb_constraint(i, lb))
-                bound_constraints.append(make_ub_constraint(i, ub))
-        # Add selected constraints (commented out by default)
-        inequality_constraints.extend([
-            #min_distance_constraint,
-            #sawtooth_max_y_constraint,
-            #sawtooth_min_y_constraint,
-            #swirl_max_y_constraint,
-            #swirl_min_y_constraint,
-            #max_energy_sawtooth_constraint,
-            #min_energy_sawtooth_constraint,
-            #max_energy_swirl_constraint,
-            #min_energy_swirl_constraint
-        ])
-        inequality_constraints.extend(bound_constraints)
-        return inequality_constraints
+                
+                constraints.append(make_lb_constraint(i, lb))
+                constraints.append(make_ub_constraint(i, ub))
+        
+        return constraints
+    
+    def _create_trajectory_constraints(self):
+        """Create trajectory-specific constraints (currently disabled)."""
+        constraints = []
+        
+        # Example constraints that can be enabled if needed:
+        # - Minimum distance between lasers
+        # - Trajectory bounds within domain
+        # - Energy density limits
+        
+        return constraints
     
     def constraint_functions(self, params_array):
         """
         Evaluate all constraints for given parameter array.
-        Returns array of constraint values (should be <= 0).
+        
+        Args:
+            params_array: flat array of optimization parameters
+            
+        Returns:
+            array: constraint values (should be <= 0)
         """
         params_dict = self.array_to_parameters(params_array)
-        laser_params, heat_params = self.unpack_parameters(params_array)
-        sawtooth_params, swirl_params = laser_params
         constraints = []
-        min_distance = self._calculate_min_laser_distance(laser_params)
-        min_allowed_distance = 0.0005
-        constraints.append(min_allowed_distance - min_distance)
-        sawtooth_y_max = params_dict['sawtooth_y0'] + params_dict['sawtooth_A']
-        sawtooth_y_min = params_dict['sawtooth_y0'] - params_dict['sawtooth_A']
-        constraints.append(sawtooth_y_max - self.model.Ly)
-        constraints.append(-sawtooth_y_min)
-        swirl_y_max = params_dict['swirl_y0'] + params_dict['swirl_A']
-        swirl_y_min = params_dict['swirl_y0'] - params_dict['swirl_A']
-        constraints.append(swirl_y_max - self.model.Ly)
-        constraints.append(-swirl_y_min)
-        Q = params_dict['Q']
-        energy_density_sawtooth = Q / (params_dict['sawtooth_v'] * 0.0002)
-        energy_density_swirl = Q / (params_dict['swirl_v'] * 0.0002)
-        max_energy_density = 100.0
-        min_energy_density = 10.0
-        #constraints.append(energy_density_sawtooth - max_energy_density)
-        #constraints.append(min_energy_density - energy_density_sawtooth)
-        #constraints.append(energy_density_swirl - max_energy_density)
-        #constraints.append(min_energy_density - energy_density_swirl)
+        
+        # Domain boundary constraints
+        constraints.extend(self._evaluate_domain_constraints(params_dict))
+        
+        # Optional: Add other constraint evaluations here
+        
         return anp.array(constraints)
+    
+    def _evaluate_domain_constraints(self, params_dict):
+        """Evaluate constraints to keep trajectories within domain."""
+        constraints = []
+        
+        # Check sawtooth trajectory bounds
+        if 'sawtooth_A' in params_dict:
+            y0 = self.initial_params.get('sawtooth_y0', 0.00125)
+            A = params_dict['sawtooth_A']
+            
+            # Maximum y constraint
+            constraints.append((y0 + A) - self.model.Ly)
+            # Minimum y constraint  
+            constraints.append(-(y0 - A))
+        
+        # Check swirl trajectory bounds
+        if 'swirl_A' in params_dict:
+            y0 = self.initial_params.get('swirl_y0', 0.00125)
+            A = params_dict['swirl_A']
+            
+            # Maximum y constraint
+            constraints.append((y0 + A) - self.model.Ly)
+            # Minimum y constraint
+            constraints.append(-(y0 - A))
+        
+        # Similar constraints for second laser if present
+        if 'sawtooth2_A' in params_dict:
+            y0 = self.initial_params.get('sawtooth2_y0', 0.00125)
+            A = params_dict['sawtooth2_A']
+            constraints.append((y0 + A) - self.model.Ly)
+            constraints.append(-(y0 - A))
+            
+        if 'swirl2_A' in params_dict:
+            y0 = self.initial_params.get('swirl2_y0', 0.00125)
+            A = params_dict['swirl2_A']
+            constraints.append((y0 + A) - self.model.Ly)
+            constraints.append(-(y0 - A))
+        
+        return constraints
 
     def _calculate_min_laser_distance(self, laser_params):
         """
         Calculate minimum distance between lasers over simulation time.
+        
+        Args:
+            laser_params: tuple of laser configurations
+            
+        Returns:
+            float: minimum distance between lasers
         """
-        sawtooth_params, swirl_params = laser_params
-        slowest_v = anp.minimum(sawtooth_params['v'], swirl_params['v'])
+        if not isinstance(laser_params, tuple) or len(laser_params) != 2:
+            return float('inf')  # No distance constraint for single laser
+        
+        laser1, laser2 = laser_params
+        
+        # Estimate simulation time based on slowest laser
+        v1 = laser1['params']['v']
+        v2 = laser2['params']['v']
+        slowest_v = anp.minimum(v1, v2)
         total_time = (self.x_range[1] - self.x_range[0]) / slowest_v
+        
+        # Sample distances over time
         n_samples = 500
         t_samples = anp.linspace(0, total_time, n_samples)
         distances = anp.zeros(n_samples)
+        
         for i, t in enumerate(t_samples):
-            x1, y1, _, _ = self.model.sawtooth_trajectory(t, sawtooth_params)
-            x2, y2, _, _ = self.model.swirl_trajectory(t, swirl_params)
+            x1, y1, _, _ = self._get_trajectory_point(t, laser1)
+            x2, y2, _, _ = self._get_trajectory_point(t, laser2)
             distances[i] = anp.sqrt((x1 - x2)**2 + (y1 - y2)**2)
-        min_dist = anp.min(distances)
-        return min_dist
+        
+        return anp.min(distances)
+
+    # ===============================
+    # Optimization Methods
+    # ===============================
+    
+    def optimize(self, objective_type='standard', method='SLSQP', max_iterations=100):
+        """
+        Run optimization using scipy's minimize.
+        
+        Args:
+            objective_type: type of objective function to use
+            method: optimization method
+            max_iterations: maximum number of iterations
+            
+        Returns:
+            tuple: (optimization_result, optimized_parameters)
+        """
+        return self.optimize_with_scipy(objective_type, method, max_iterations)
     
     def optimize_with_scipy(self, objective_type='standard', method='SLSQP', max_iterations=100):
         """
         Run optimization using scipy's minimize with selected objective and constraints.
+        
+        Args:
+            objective_type: objective function type
+            method: scipy optimization method
+            max_iterations: maximum iterations
+            
+        Returns:
+            tuple: (result, optimized_params)
         """
+        # Available objective functions
         objective_functions = {
             'standard': self.objective_function,
             'max_gradient': self.objective_max_gradient,
@@ -499,53 +1140,77 @@ class TrajectoryOptimizer:
             'thermal_uniformity': self.objective_thermal_uniformity,
             'max_temp_difference': self.objective_max_temp_difference
         }
+        
         if objective_type not in objective_functions:
             raise ValueError(f"Unknown objective type: {objective_type}. "
-                            f"Choose from: {list(objective_functions.keys())}")
+                           f"Choose from: {list(objective_functions.keys())}")
+        
         objective_func = objective_functions[objective_type]
         initial_params_array = self.parameters_to_array(self.initial_params)
+        
+        # Set up constraints for constrained methods
         constraints = None
         if method.upper() in ['SLSQP', 'COBYLA']:
             constraints = [{
                 'type': 'ineq',
-                'fun': lambda x: self.constraint_functions(x)
+                'fun': lambda x: -self.constraint_functions(x)  # Convert to <= 0 form
             }]
-        print(f"Starting optimization with {objective_type} objective using scipy method: {method}")
-        bounds_list = [(self.bounds[name][0], self.bounds[name][1]) for name in self.param_names]
+        
+        # Set up bounds
+        bounds_list = [(self.bounds[name][0], self.bounds[name][1]) 
+                      for name in self.param_names if name in self.bounds]
+        
+        print(f"Starting optimization with {objective_type} objective using {method}")
+        
+        # Run optimization
         result = minimize(
             objective_func,
             initial_params_array,
             method=method,
             constraints=constraints,
-            bounds=bounds_list,
+            bounds=bounds_list if bounds_list else None,
             options={
-                'maxiter': max_iterations, 
+                'maxiter': max_iterations,
                 'disp': True,
                 'xtol': 1e-10,
                 'ftol': 1e-10
             }
         )
+        
+        # Convert result back to parameter dictionary
         optimized_params = self.array_to_parameters(result.x)
-        print("Optimization complete.")
+        
+        # Print optimization summary
+        self._print_optimization_summary(result, optimized_params)
+        
+        return result, optimized_params
+    
+    def _print_optimization_summary(self, result, optimized_params):
+        """Print optimization results summary."""
+        print("\nOptimization complete.")
         print(f"Success: {result.success}")
         print(f"Message: {result.message}")
         print(f"Iterations: {result.nit}")
+        print(f"Function evaluations: {result.nfev}")
+        
         print("\nOptimized Parameters:")
         for name, value in optimized_params.items():
             print(f"  {name}: {value:.6f}")
-        return result, optimized_params
 
-    def optimize(self, objective_type='standard', method='SLSQP', max_iterations=100):
-        """Convenience wrapper for optimize_with_scipy."""
-        return self.optimize_with_scipy(
-            objective_type=objective_type, 
-            method=method, 
-            max_iterations=max_iterations
-        )
+    # ===============================
+    # Analysis Methods
+    # ===============================
     
     def perform_sensitivity_analysis(self, best_params, objective_type='standard'):
         """
         Perform sensitivity analysis for each parameter around optimized solution.
+        
+        Args:
+            best_params: dictionary of optimized parameters
+            objective_type: objective function to use for analysis
+            
+        Returns:
+            dict: sensitivity data for each parameter
         """
         objective_functions = {
             'standard': self.objective_function,
@@ -554,55 +1219,74 @@ class TrajectoryOptimizer:
             'thermal_uniformity': self.objective_thermal_uniformity,
             'max_temp_difference': self.objective_max_temp_difference
         }
+        
         objective_func = objective_functions[objective_type]
         best_params_array = self.parameters_to_array(best_params)
         base_obj = objective_func(best_params_array)
+        
         sensitivity_data = {}
+        
         print("\n=== Sensitivity Analysis ===")
         print(f"Base objective value: {base_obj:.6e}")
+        
         # Test sensitivity for each parameter
         for i, name in enumerate(self.param_names):
-            # Create perturbed parameter sets
-            perturb_amount = max(best_params_array[i] * 0.05, 1e-6)  # 5% perturbation
-            
-            # +5% perturbation
-            params_plus = best_params_array.copy()
-            params_plus[i] += perturb_amount
-            obj_plus = objective_func(params_plus)
-            
-            # -5% perturbation
-            params_minus = best_params_array.copy()
-            params_minus[i] -= perturb_amount
-            obj_minus = objective_func(params_minus)
-            
-            # Calculate sensitivity (finite difference approximation)
-            sensitivity_plus = (obj_plus - base_obj) / perturb_amount
-            sensitivity_minus = (base_obj - obj_minus) / perturb_amount
-            
-            # Average sensitivity
-            avg_sensitivity = (sensitivity_plus + sensitivity_minus) / 2
-            
-            sensitivity_data[name] = {
-                'value': best_params[name],
-                'sensitivity': avg_sensitivity,
-                'rel_sensitivity': avg_sensitivity * best_params[name] / base_obj
-            }
-            
-            print(f"Parameter: {name}")
-            print(f"  Value: {best_params[name]:.6f}")
-            print(f"  Absolute Sensitivity: {avg_sensitivity:.6e}")
-            print(f"  Relative Sensitivity: {sensitivity_data[name]['rel_sensitivity']:.6e}")
+            sensitivity_data[name] = self._calculate_parameter_sensitivity(
+                name, i, best_params_array, base_obj, objective_func
+            )
         
-        # Sort parameters by relative sensitivity
-        sorted_params = sorted(sensitivity_data.items(), 
-                              key=lambda x: abs(x[1]['rel_sensitivity']), 
-                              reverse=True)
+        # Print ranked sensitivity results
+        self._print_sensitivity_ranking(sensitivity_data)
+        
+        return sensitivity_data
+    
+    def _calculate_parameter_sensitivity(self, name, index, base_params, base_obj, objective_func):
+        """Calculate sensitivity for a single parameter."""
+        # Perturbation amount (5% of parameter value)
+        perturb_amount = max(base_params[index] * 0.05, 1e-6)
+        
+        # +5% perturbation
+        params_plus = base_params.copy()
+        params_plus[index] += perturb_amount
+        obj_plus = objective_func(params_plus)
+        
+        # -5% perturbation
+        params_minus = base_params.copy()
+        params_minus[index] -= perturb_amount
+        obj_minus = objective_func(params_minus)
+        
+        # Calculate sensitivity (finite difference approximation)
+        sensitivity_plus = (obj_plus - base_obj) / perturb_amount
+        sensitivity_minus = (base_obj - obj_minus) / perturb_amount
+        
+        # Average sensitivity
+        avg_sensitivity = (sensitivity_plus + sensitivity_minus) / 2
+        
+        # Relative sensitivity
+        rel_sensitivity = avg_sensitivity * base_params[index] / base_obj if base_obj != 0 else 0
+        
+        print(f"Parameter: {name}")
+        print(f"  Value: {base_params[index]:.6f}")
+        print(f"  Absolute Sensitivity: {avg_sensitivity:.6e}")
+        print(f"  Relative Sensitivity: {rel_sensitivity:.6e}")
+        
+        return {
+            'value': base_params[index],
+            'sensitivity': avg_sensitivity,
+            'rel_sensitivity': rel_sensitivity
+        }
+    
+    def _print_sensitivity_ranking(self, sensitivity_data):
+        """Print parameters ranked by sensitivity."""
+        sorted_params = sorted(
+            sensitivity_data.items(),
+            key=lambda x: abs(x[1]['rel_sensitivity']),
+            reverse=True
+        )
         
         print("\nParameters ranked by sensitivity:")
         for i, (name, data) in enumerate(sorted_params):
             print(f"{i+1}. {name}: {abs(data['rel_sensitivity']):.6e}")
-        
-        return sensitivity_data
     
  
 # ===============================
@@ -610,632 +1294,2338 @@ class TrajectoryOptimizer:
 # ===============================
 
 class Visualization:
+    """
+    Visualization class for LPBF heat transfer simulation results.
+    
+    Provides methods for comparing simulations, generating animations,
+    and visualizing temperature fields and laser trajectories.
+    """
+    
     def __init__(self, model):
-        # Store reference to heat transfer model
+        """
+        Initialize visualization with heat transfer model.
+        
+        Args:
+            model: HeatTransferModel instance
+        """
         self.model = model
-
+        
+        # Define thermal colormap for consistent visualization
+        self.thermal_colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), 
+                              (1, 1, 0), (1, 0, 0), (1, 1, 1)]
+        self.cmap_temp = LinearSegmentedColormap.from_list('thermal', self.thermal_colors)
+    
+    # ===============================
+    # Raster Scan Generation
+    # ===============================
+    
     def generate_raster_scan(self, x_start, x_end, y_start, y_end, n_lines, speed):
-        """Generate raster scan path covering the area at given speed."""
+        """
+        Generate raster scan path covering specified area at given speed.
+        
+        Args:
+            x_start, x_end: x-range for scan (meters)
+            y_start, y_end: y-range for scan (meters)
+            n_lines: number of scan lines
+            speed: scan speed (m/s)
+            
+        Returns:
+            tuple: (path_array, speed) where path_array is Nx2 array of (x,y) points
+        """
         x_vals = np.linspace(x_start, x_end, self.model.nx)
         y_vals = np.linspace(y_start, y_end, n_lines)
+        
         path = []
         for i, y in enumerate(y_vals):
+            # Alternate scan direction for each line
             xs = x_vals if i % 2 == 0 else x_vals[::-1]
             for x in xs:
                 path.append((x, y))
+                
         return np.array(path), speed
+    
+    def _create_raster_trajectory_function(self, raster_path, raster_speed, x_end, x_start=0):
+        def raster_trajectory(t, params):
+            v = raster_speed  # Actual speed along the raster path
+            noise_sigma = params.get('noise_sigma', 0.0)
+        
+            # Limit noise to reasonable bounds
+            max_noise = 0.00005
+            noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
+        
+            hatch_spacing = 0.00008
+            y_start = 0.0002
+            y_end = 0.0008
 
-    def compare_simulations(self, initial_params, optimized_params, use_gaussian=True, y_crop=None, show_full_domain=True):
+            # Arc-length based raster scan
+            target_distance = v * t  # Total distance traveled along raster path
+        
+            horizontal_distance = x_end - x_start
+            vertical_distance = hatch_spacing
+        
+            # Each "pass" consists of horizontal scan + vertical move
+            pass_distance = horizontal_distance + vertical_distance
+        
+            # Which pass are we in?
+            pass_num = int(target_distance / pass_distance)
+            distance_in_pass = target_distance - pass_num * pass_distance
+        
+            y_current = y_start + pass_num * hatch_spacing
+
+            # Check if we've reached the end
+            max_passes = int((y_end - y_start) / hatch_spacing) + 2
+        
+            if pass_num >= max_passes or y_current > y_end:
+                final_y = min(y_end, y_start + (max_passes-1) * hatch_spacing)
+                return x_end, final_y, 1.0, 0.0
+
+            # Apply random noise
+            if noise_sigma > 0:
+                noise_x = noise_sigma * np.random.randn()
+                noise_y = noise_sigma * np.random.randn()
+            else:
+                noise_x, noise_y = 0.0, 0.0
+
+            if distance_in_pass <= horizontal_distance:
+                # Horizontal scanning phase
+                if pass_num % 2 == 0:
+                    # Left to right
+                    x = x_start + distance_in_pass + noise_x
+                    y = y_current + noise_y
+                    tx, ty = 1.0, 0.0
+                else:
+                    # Right to left
+                    x = x_end - distance_in_pass + noise_x
+                    y = y_current + noise_y
+                    tx, ty = -1.0, 0.0
+            
+                x = max(x_start, min(x, x_end))
+            else:
+                # Vertical transition phase
+                vertical_progress = distance_in_pass - horizontal_distance
+            
+                if pass_num % 2 == 0:
+                    x = x_end + noise_x
+                else:
+                    x = x_start + noise_x
+            
+                y = y_current + vertical_progress + noise_y
+                tx, ty = 0.0, 1.0
+
+            # Apply boundary constraints
+            x = max(x_start, min(x, x_end))
+            y = max(0, min(y, y_end))
+
+            return x, y, tx, ty
+        return raster_trajectory
+    
+    # ===============================
+    # Simulation Comparison
+    # ===============================
+    
+    def compare_simulations(self, initial_params, optimized_params, use_gaussian=True, 
+                        y_crop=None, show_full_domain=True):
         """
         Compare temperature and gradient fields for raster scan vs. optimized scan.
         Overlays scan paths and melt pool contours.
+
+        Args:
+            initial_params: dictionary of initial parameters
+            optimized_params: dictionary of optimized parameters
+            use_gaussian: whether to use Gaussian heat source
+            y_crop: y-range for cropping display (unused, kept for compatibility)
+            show_full_domain: whether to show full domain (unused, kept for compatibility)
+    
+        Returns:
+            matplotlib.figure.Figure: comparison plot
         """
-        # Raster scan setup
-        x_start, x_end = 0, self.model.Lx
-        y_start = 0.0010
-        y_end = 0.0015
-        hatch_spacing = 0.00005
-        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
-        raster_speed = 0.05
-        raster_path, raster_v = self.generate_raster_scan(x_start, x_end, y_start, y_end, n_lines, raster_speed)
+        # Setup raster scan reference
+        raster_config = self._setup_raster_scan()
+        T_raster, grad_raster, raster_positions, raster_temporal_stats = self._simulate_raster_scan(raster_config)
 
-        # Simulate raster scan as single laser following raster_path
-        heat_params = (
-            {'Q': 200.0, 'r0': 0.00005},
-            {'Q': 200.0, 'r0': 0.00005}
-        )
-        def raster_trajectory(t, params):
-            idx = int(t * raster_v * len(raster_path) / (x_end - x_start))
-            idx = np.clip(idx, 0, len(raster_path) - 1)
-            x, y = raster_path[idx]
-            return x, y, 1, 0
-
-        # Override trajectory functions for raster scan simulation
-        orig_sawtooth = self.model.sawtooth_trajectory
-        orig_swirl = self.model.swirl_trajectory
-        self.model.sawtooth_trajectory = raster_trajectory
-        self.model.swirl_trajectory = raster_trajectory
-
-        raster_laser_params = (
-            {'v': raster_v, 'A': 0, 'y0': 0, 'period': 1, 'noise_sigma': 0},
-            {'v': raster_v, 'A': 0, 'y0': 0, 'fr': 1, 'noise_sigma': 0}
-        )
-        T_raster = self.model.simulate((raster_laser_params, heat_params), use_gaussian=use_gaussian)
-
-        # Restore original trajectory functions
-        self.model.sawtooth_trajectory = orig_sawtooth
-        self.model.swirl_trajectory = orig_swirl
-
-        # Simulate optimized scan
-        temp_optimizer = TrajectoryOptimizer(self.model, initial_params=initial_params, bounds=None)
-        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
-        laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
-        T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian)
-
-        # Generate scan paths for overlay
-        dt = self.model.dt
-        nt = self.model.nt
-        t_points = np.linspace(0, nt * dt, nt)
-        raster_x_time = []
-        raster_y_time = []
-        for t in t_points:
-            x, y, _, _ = raster_trajectory(t, raster_laser_params[0])
-            raster_x_time.append(x * 1000)
-            raster_y_time.append(y * 1000)
-
-        sawtooth_params, swirl_params = laser_opt
-        saw_x = []
-        saw_y = []
-        swirl_x = []
-        swirl_y = []
-        for t in t_points:
-            x1, y1, _, _ = self.model.sawtooth_trajectory(t, sawtooth_params)
-            x2, y2, _, _ = self.model.swirl_trajectory(t, swirl_params)
-            saw_x.append(x1 * 1000)
-            saw_y.append(y1 * 1000)
-            swirl_x.append(x2 * 1000)
-            swirl_y.append(y2 * 1000)
-
-        # Compute temperature gradients
-        _, _, grad_raster = self.model.compute_temperature_gradients(T_raster)
-        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
-
-        # Visualization setup
-        colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
-        cmap_temp = LinearSegmentedColormap.from_list('thermal', colors)
-        fig = plt.figure(figsize=(16, 8))
-        ax1 = fig.add_subplot(2, 2, 1)
-        ax2 = fig.add_subplot(2, 2, 2)
-        ax3 = fig.add_subplot(2, 2, 3)
-        ax4 = fig.add_subplot(2, 2, 4)
-
-        extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]
-        im1 = ax1.imshow(T_raster, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto')
-        ax1.set_title('Raster Scan Temperature')
-        ax1.set_xlabel('X (mm)')
-        ax1.set_ylabel('Y (mm)')
-        fig.colorbar(im1, ax=ax1, label='Temperature (°C)')
-        ax1.plot(raster_x_time, raster_y_time, color='black', linewidth=1, label='Raster Laser Path')
-        ax1.legend()
-        # Annotate gradient statistics
-        max_grad_raster = np.max(grad_raster) / 1000
-        mean_grad_raster = np.mean(grad_raster) / 1000
-        ax1.text(
-            0.02, 0.98,
-            f"Max ∇T: {max_grad_raster:.2e} °C/mm\nMean ∇T: {mean_grad_raster:.2e} °C/mm",
-            transform=ax1.transAxes, fontsize=10, color='white', verticalalignment='top',
-            bbox=dict(facecolor='black', alpha=0.5, boxstyle='round')
+        # FIXED: Setup and simulate optimized scan - now returns ACTUAL positions used
+        T_opt, grad_opt, laser_paths, opt_temporal_stats = self._simulate_optimized_scan(
+            initial_params, optimized_params, use_gaussian
         )
 
-        im2 = ax2.imshow(T_opt, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto')
-        ax2.set_title('Optimized Scan Temperature')
-        ax2.set_xlabel('X (mm)')
-        ax2.set_ylabel('Y (mm)')
-        fig.colorbar(im2, ax=ax2, label='Temperature (°C)')
-        ax2.plot(saw_x, saw_y, color='red', linewidth=1, label='Sawtooth Path')
-        ax2.plot(swirl_x, swirl_y, color='black', linewidth=1, label='Swirl Path')
-        ax2.legend();
-        max_grad_opt = np.max(grad_opt) / 1000
-        mean_grad_opt = np.mean(grad_opt) / 1000
-        ax2.text(
-            0.02, 0.98,
-            f"Max ∇T: {max_grad_opt:.2e} °C/mm\nMean ∇T: {mean_grad_opt:.2e} °C/mm",
-            transform=ax2.transAxes, fontsize=10, color='white', verticalalignment='top',
-            bbox=dict(facecolor='black', alpha=0.5, boxstyle='round'))
-
-        # Show gradient fields
-        grad_cmap = plt.get_cmap('viridis')
-        im3 = ax3.imshow(grad_raster, extent=extent, origin='lower', cmap=grad_cmap, aspect='auto')
-        ax3.set_title('Raster Scan Temperature Gradient')
-        ax3.set_xlabel('X (mm)')
-        ax3.set_ylabel('Y (mm)')
-        fig.colorbar(im3, ax=ax3, label='|∇T| (°C/mm)')
-        ax3.plot(raster_x_time, raster_y_time, color='black', linewidth=1, label='Raster Laser Path')
-        ax3.legend()
-
-        im4 = ax4.imshow(grad_opt, extent=extent, origin='lower', cmap=grad_cmap, aspect='auto')
-        ax4.set_title('Optimized Scan Temperature Gradient')
-        ax4.set_xlabel('X (mm)')
-        ax4.set_ylabel('Y (mm)')
-        fig.colorbar(im4, ax=ax4, label='|∇T| (°C/mm)')
-        ax4.plot(saw_x, saw_y, color='red', linewidth=1, label='Sawtooth Path')
-        ax4.plot(swirl_x, swirl_y, color='black', linewidth=1, label='Swirl Path')
-        ax4.legend()
-
-        # Overlay melt pool contours
-        T_melt = self.model.material['T_melt']
-        melt_mask_raster = T_raster > T_melt
-        melt_mask_opt = T_opt > T_melt
-        ax1.contour(melt_mask_raster, levels=[0.5], colors='cyan', linewidths=2, extent=extent, origin='lower')
-        ax2.contour(melt_mask_opt, levels=[0.5], colors='cyan', linewidths=2, extent=extent, origin='lower')
+        # Create comparison visualization
+        fig = self._create_comparison_plots(
+            T_raster, grad_raster, raster_positions, raster_temporal_stats,
+            T_opt, grad_opt, laser_paths, optimized_params, opt_temporal_stats
+        )
 
         plt.tight_layout()
         plt.show()
         return fig
+    
+    def _setup_raster_scan(self):
+        """Setup raster scan configuration with 1.5mm margins."""
+        x_start = 0.0015  # 1.5mm from left edge
+        x_end = self.model.Lx - 0.0015  # 1.5mm from right edge
+        y_start, y_end = 0.0002, 0.0008
+        hatch_spacing = 0.00008  # Changed to 80 micrometers
+        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
+        raster_speed = 0.2
+    
+        raster_path, _ = self.generate_raster_scan(
+            x_start, x_end, y_start, y_end, n_lines, raster_speed
+        )
+    
+        heat_params = (
+            {'Q': 200.0, 'r0': 0.00004},
+            {'Q': 200.0, 'r0': 0.00004}
+        )
+    
+        return {
+            'path': raster_path,
+            'speed': raster_speed,
+            'x_start': x_start,
+            'x_end': x_end,
+            'heat_params': heat_params
+        }
+    
+    def _simulate_raster_scan(self, raster_config):
+        """
+        Simulate raster scan and extract results.
+        """
+        # Create raster trajectory function using the mathematical approach
+        raster_trajectory = self._create_raster_trajectory_function(
+            raster_config['path'], raster_config['speed'], 
+            raster_config['x_end'], raster_config['x_start']
+        )
 
-    def animate_optimization_results(self, model, initial_params, optimized_params, fps=30, show_full_domain=True, y_crop=None, save_snapshots=True, snapshot_interval=0.01, snapshot_dir="animation_snapshots"):
+        # Temporarily override trajectory functions
+        orig_sawtooth = self.model.sawtooth_trajectory
+        orig_swirl = self.model.swirl_trajectory
+
+        self.model.sawtooth_trajectory = raster_trajectory
+        self.model.swirl_trajectory = raster_trajectory
+
+        try:
+            raster_heat_params = (
+                {'Q': 200.0, 'r0': 0.00004},
+                {'Q': 200.0, 'r0': 0.00004}
+            )
+        
+            raster_laser_params = (
+                {'type': 'sawtooth', 'params': {
+                    'v': raster_config['speed'], 'A': 0, 'y0': 0, 
+                    'period': 1, 'noise_sigma': 0
+                }},
+                {'type': 'swirl', 'params': {
+                    'v': raster_config['speed'], 'A': 0, 'y0': 0, 
+                    'fr': 1, 'noise_sigma': 0
+                }}
+            )
+
+            # Run simulation - this updates temporal_grad_stats
+            T_raster = self.model.simulate(
+                (raster_laser_params, raster_heat_params), 
+                use_gaussian=True
+            )
+
+            # FIXED: Calculate gradient from the FINAL temperature field
+            # This is what should be shown in the gradient plots
+            _, _, grad_raster = self.model.compute_temperature_gradients(T_raster)
+        
+            # Get temporal statistics that were collected DURING simulation
+            raster_temporal_stats = self.model.temporal_grad_stats
+        
+            # DIAGNOSTIC: Print to verify values
+            print(f"\nRaster Scan Statistics:")
+            print(f"  Final max gradient: {np.max(grad_raster):.2e} °C/m")
+            print(f"  Temporal max gradient: {raster_temporal_stats['max_over_time']:.2e} °C/m")
+            print(f"  Ratio (temporal/final): {raster_temporal_stats['max_over_time']/np.max(grad_raster):.2f}")
+
+            raster_positions = self._extract_laser_positions_mathematical(
+                raster_trajectory, raster_config['speed']
+            )
+
+        finally:
+            # Restore original trajectory functions
+            self.model.sawtooth_trajectory = orig_sawtooth
+            self.model.swirl_trajectory = orig_swirl
+
+        return T_raster, grad_raster, raster_positions, raster_temporal_stats
+    
+    def _extract_laser_positions_mathematical(self, trajectory_func, speed):
+        """Extract laser positions using mathematical raster trajectory."""
+        nt = self.model.nt if hasattr(self.model, 'nt') and self.model.nt else 3000
+        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
+        t_points = np.linspace(0, nt * dt, nt)
+    
+        positions = []
+        for t in t_points:
+            x, y, _, _ = trajectory_func(t, {'v': speed})
+            positions.append((x * 1000, y * 1000))  # Convert to mm
+        
+        return positions
+    
+    def _simulate_optimized_scan(self, initial_params, optimized_params, use_gaussian):
+        """
+        Simulate optimized scan and extract results.
+        NOW TRACKS ACTUAL LASER POSITIONS DURING SIMULATION.
+        """
+            # Setup optimizer and unpack parameters
+        temp_optimizer = TrajectoryOptimizer(
+            self.model, initial_params=initial_params, bounds=None
+        )
+        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
+        laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
+
+        # Determine heat source type
+        if isinstance(heat_opt, (list, tuple)):
+            use_gaussian_opt = 'r0' in heat_opt[0]
+        else:
+            use_gaussian_opt = 'r0' in heat_opt
+
+        # FIXED: Only reset ONCE, then track positions during simulation
+        # We'll modify simulate to track positions internally
+        # Store a flag to track positions
+        self.model._track_laser_positions = True
+        self.model._laser_position_history = {'straight': [], 'sawtooth': [], 'swirl': []}
+    
+        # Run simulation - this will track positions internally
+        T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian_opt)
+    
+        # Extract the tracked positions
+        laser_paths = self.model._laser_position_history
+    
+        # Clean up tracking flags
+        self.model._track_laser_positions = False
+        self.model._laser_position_history = None
+    
+        # Calculate gradient from final temperature field
+        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
+        opt_temporal_stats = self.model.temporal_grad_stats
+
+        return T_opt, grad_opt, laser_paths, opt_temporal_stats
+
+    def _track_positions_during_simulation(self, laser_opt):
+        """
+        Track laser positions using the SAME time evolution as the simulation.
+        This must be called AFTER reset() to use the same initial noise state.
+        Only records positions while laser is actively scanning (not clamped at boundary).
+        """
+        nt = 6000  # Must match self.model.nt in simulate()
+        dt = self.model.dt
+        t_points = np.linspace(0, nt * dt, nt)
+
+        paths = {'straight': [], 'sawtooth': [], 'swirl': []}
+
+        # Handle single or dual laser configuration
+        laser_list = laser_opt if isinstance(laser_opt, tuple) else [laser_opt]
+    
+        # Domain boundaries
+        x_start = 0.0015
+        x_end = self.model.Lx - 0.0015
+    
+        for laser in laser_list:
+            x_list, y_list = [], []
+            scan_complete = False
+        
+            for t in t_points:
+                # ALWAYS call trajectory function to maintain noise state sync
+                if laser['type'] == 'straight':
+                    x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
+                elif laser['type'] == 'sawtooth':
+                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
+                else:  # swirl
+                    x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
+        
+                # Only record position if laser hasn't reached the end yet
+                if not scan_complete:
+                    x_list.append(x * 1000)  # Convert to mm
+                    y_list.append(y * 1000)
+                
+                    # Check if laser has reached the end boundary
+                    # Use a small tolerance to detect when clamping starts
+                    if x >= (x_end - 1e-6):
+                        scan_complete = True
+        
+            paths[laser['type']].append((x_list, y_list))
+
+        return paths
+    
+    def _extract_laser_positions(self, trajectory_func, speed):
+        """Extract laser positions over time for raster scan."""
+        nt = self.model.nt if hasattr(self.model, 'nt') and self.model.nt else 3000
+        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
+        t_points = np.linspace(0, nt * dt, nt)
+        
+        positions = []
+        for t in t_points:
+            x, y, _, _ = trajectory_func(t, {'v': speed})
+            positions.append((x * 1000, y * 1000))  # Convert to mm
+            
+        return positions
+    
+    def _extract_optimized_paths(self, laser_params):
+        """Extract optimized laser paths for plotting - now includes actual noisy positions."""
+        nt = self.model.nt if hasattr(self.model, 'nt') and self.model.nt else 3000
+        dt = self.model.dt if hasattr(self.model, 'dt') else 1e-5
+        t_points = np.linspace(0, nt * dt, nt)
+
+        paths = {'straight': [], 'sawtooth': [], 'swirl': []}
+
+        # Handle single or dual laser configuration
+        laser_list = laser_params if isinstance(laser_params, tuple) else [laser_params]
+
+        for laser in laser_list:
+            x_list, y_list = [], []
+    
+            # FIXED: Reset noise state before extracting path to match simulation
+            if laser['type'] == 'sawtooth':
+                if hasattr(self.model, '_noise_state'):
+                    self.model._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+            elif laser['type'] == 'swirl':
+                if hasattr(self.model, '_noise_state_swirl'):
+                    self.model._noise_state_swirl = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+            elif laser['type'] == 'straight':
+                if hasattr(self.model, '_noise_state_straight'):
+                    self.model._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+    
+            for t in t_points:
+                # Get ACTUAL noisy position (same as what simulation used)
+                if laser['type'] == 'straight':
+                    x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
+                elif laser['type'] == 'sawtooth':
+                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
+                else:  # swirl
+                    x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
+        
+                x_list.append(x * 1000)  # Convert to mm
+                y_list.append(y * 1000)
+    
+            paths[laser['type']].append((x_list, y_list))
+
+        return paths
+    
+    def _create_comparison_plots(self, T_raster, grad_raster, raster_positions, raster_temporal_stats,
+                                T_opt, grad_opt, laser_paths, optimized_params, opt_temporal_stats):
+        """
+        Create 2x2 comparison plot layout.
+        """
+        fig = plt.figure(figsize=(16, 8))
+
+        # Create subplots
+        ax1 = fig.add_subplot(2, 2, 1)  # Raster temperature
+        ax2 = fig.add_subplot(2, 2, 2)  # Optimized temperature
+        ax3 = fig.add_subplot(2, 2, 3)  # Raster gradient
+        ax4 = fig.add_subplot(2, 2, 4)  # Optimized gradient
+
+        extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]
+
+        # Plot temperature fields
+        self._plot_temperature_field(ax1, T_raster, extent, "Raster Scan Temperature")
+        self._plot_temperature_field(ax2, T_opt, extent, "Optimized Scan Temperature")
+
+        # Plot gradient fields
+        self._plot_gradient_field(ax3, grad_raster, extent, "Raster Scan Temperature Gradient")
+        self._plot_gradient_field(ax4, grad_opt, extent, "Optimized Scan Temperature Gradient")
+
+        # Add laser paths and annotations
+        self._add_raster_paths(ax1, ax3, raster_positions)
+        self._add_optimized_paths(ax2, ax4, laser_paths, optimized_params)
+
+        # Add melt pool contours
+        self._add_melt_pool_contours(ax1, T_raster, extent)
+        self._add_melt_pool_contours(ax2, T_opt, extent)
+
+        # FIXED: Only add temporal statistics to TOP row (temperature plots)
+        # These show peak gradients that occurred during simulation
+        self._add_gradient_statistics(ax1, grad_raster, temporal_stats=raster_temporal_stats, 
+                                      is_raster=True, label_type='temporal')
+        self._add_gradient_statistics(ax2, grad_opt, temporal_stats=opt_temporal_stats, 
+                                      is_raster=False, label_type='temporal')
+    
+        # Bottom row: NO labels (colorbar shows the scale)
+        # Do NOT call _add_gradient_statistics for ax3 and ax4
+
+        return fig
+    
+    def _plot_temperature_field(self, ax, T_field, extent, title):
+        """Plot temperature field on given axis."""
+        im = ax.imshow(T_field, extent=extent, origin='lower', 
+                      cmap=self.cmap_temp, aspect='auto')
+        ax.set_title(title)
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        plt.colorbar(im, ax=ax, label='Temperature (°C)')
+        return im
+    
+    def _plot_gradient_field(self, ax, grad_field, extent, title):
+        """Plot gradient field on given axis with correct units."""
+        # FIXED: Convert gradient field from °C/m to °C/mm for display
+        grad_field_mm = grad_field / 1000  # Convert °C/m to °C/mm
+    
+        grad_cmap = plt.get_cmap('viridis')
+        im = ax.imshow(grad_field_mm, extent=extent, origin='lower', 
+                      cmap=grad_cmap, aspect='auto')
+        ax.set_title(title)
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        plt.colorbar(im, ax=ax, label='|∇T| (°C/mm)')
+        return im
+    
+    def _add_raster_paths(self, temp_ax, grad_ax, raster_positions):
+        """Add raster scan paths to temperature and gradient plots."""
+        raster_x = [pos[0] for pos in raster_positions]
+        raster_y = [pos[1] for pos in raster_positions]
+    
+        # Plot the scan path lines
+        temp_ax.plot(raster_x, raster_y, color='black', linewidth=1, 
+                    label='Raster Laser Path')
+        grad_ax.plot(raster_x, raster_y, color='black', linewidth=1, 
+                    label='Raster Laser Path')
+    
+    
+        temp_ax.legend()
+        grad_ax.legend()
+    
+    
+    def _add_optimized_paths(self, temp_ax, grad_ax, laser_paths, optimized_params):
+        """Add optimized laser paths to temperature and gradient plots - NO END MARKERS."""
+        colors = ['red', 'black']
+        laser_types = ['straight', 'sawtooth', 'swirl']
+
+        laser_assignments = []
+        for laser_type in laser_types:
+            if laser_paths[laser_type]:
+                for path_idx, (x_list, y_list) in enumerate(laser_paths[laser_type]):
+                    color = colors[len(laser_assignments)]
+        
+                    # Plot the actual simulated path (already in mm)
+                    temp_ax.plot(x_list, y_list, color=color, linewidth=1)
+                    grad_ax.plot(x_list, y_list, color=color, linewidth=1)
+        
+                    # Create legend label
+                    heat_source_num = len(laser_assignments) + 1
+                    label = f"Heat Source {heat_source_num}: {laser_type.capitalize()}"
+        
+                    # Add legend entry
+                    temp_ax.plot([], [], color=color, linewidth=2, label=label)
+                    grad_ax.plot([], [], color=color, linewidth=2, label=label)
+        
+                    # REMOVED: No end position markers
+                    laser_assignments.append((laser_type, path_idx))
+
+        temp_ax.legend()
+        grad_ax.legend()
+    
+    def _add_melt_pool_contours(self, ax, T_field, extent):
+        """Add melt pool contours to temperature plot."""
+        T_melt = self.model.material['T_melt']
+        melt_mask = T_field > T_melt
+        ax.contour(melt_mask, levels=[0.5], colors='cyan', linewidths=2, 
+                  extent=extent, origin='lower')
+    
+
+    def _add_gradient_statistics(self, ax, grad_field, temporal_stats=None, is_raster=False, label_type='temporal'):
+        """Add gradient statistics annotation to plot with correct unit conversions."""
+    
+        if label_type == 'temporal' and temporal_stats:
+            # FIXED: Temporal statistics are stored in °C/m, convert to °C/mm for display
+            max_grad_temporal = temporal_stats['max_over_time'] / 1000  # Convert °C/m to °C/mm
+            mean_grad_temporal = temporal_stats['mean_over_time'] / 1000  # Convert °C/m to °C/mm
+        
+            stats_text = (
+                f"Peak Over Simulation:\n"
+                f"Max ∇T: {max_grad_temporal:.2e} °C/mm\n"
+                f"Mean ∇T: {mean_grad_temporal:.2e} °C/mm"
+            )
+        else:
+            # FIXED: Final state statistics - grad_field is in °C/m, convert to °C/mm
+            max_grad_final = np.max(grad_field) / 1000  # Convert °C/m to °C/mm  
+            mean_grad_final = np.mean(grad_field) / 1000  # Convert °C/m to °C/mm
+        
+            stats_text = (
+                f"Final State:\n"
+                f"Max ∇T: {max_grad_final:.2e} °C/mm\n"
+                f"Mean ∇T: {mean_grad_final:.2e} °C/mm"
+            )
+
+        # Position text box
+        x_pos = 0.02
+        y_pos = 0.98
+
+        ax.text(x_pos, y_pos, stats_text, transform=ax.transAxes, fontsize=9, 
+               color='white', verticalalignment='top',
+               bbox=dict(facecolor='black', alpha=0.7, boxstyle='round,pad=0.3'))
+
+    def plot_temporal_gradients(self, raster_temporal_stats, opt_temporal_stats):
+        """
+        Plot temporal evolution of gradient statistics.
+    
+        Args:
+            raster_temporal_stats: temporal gradient statistics for raster scan
+            opt_temporal_stats: temporal gradient statistics for optimized scan
+        """
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+        # Time arrays (assuming same time steps)
+        nt = len(raster_temporal_stats['max_gradients'])
+        dt = self.model.dt
+        time_points = np.arange(nt) * dt
+    
+        # Plot maximum gradients over time
+        ax1.plot(time_points, np.array(raster_temporal_stats['max_gradients'])/1000, 
+                 'b-', label='Raster Scan', linewidth=2)
+        ax1.plot(time_points, np.array(opt_temporal_stats['max_gradients'])/1000, 
+                 'r-', label='Optimized Scan', linewidth=2)
+        ax1.set_ylabel('Maximum ∇T (°C/mm)')
+        ax1.set_title('Maximum Temperature Gradient Evolution')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+    
+        # Plot mean gradients over time
+        ax2.plot(time_points, np.array(raster_temporal_stats['mean_gradients'])/1000, 
+                 'b-', label='Raster Scan', linewidth=2)
+        ax2.plot(time_points, np.array(opt_temporal_stats['mean_gradients'])/1000, 
+                 'r-', label='Optimized Scan', linewidth=2)
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Mean ∇T (°C/mm)')
+        ax2.set_title('Mean Temperature Gradient Evolution')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+        plt.tight_layout()
+        plt.show()
+    
+        # Print summary statistics
+        print("\n=== Temporal Gradient Analysis ===")
+        print(f"Raster Scan:")
+        print(f"  Max gradient over all time: {raster_temporal_stats['max_over_time']/1000:.2e} °C/mm")
+        print(f"  Mean gradient over all time: {raster_temporal_stats['mean_over_time']/1000:.2e} °C/mm")
+        print(f"Optimized Scan:")
+        print(f"  Max gradient over all time: {opt_temporal_stats['max_over_time']/1000:.2e} °C/mm")
+        print(f"  Mean gradient over all time: {opt_temporal_stats['mean_over_time']/1000:.2e} °C/mm")
+    
+        # Calculate improvements
+        max_improvement = ((raster_temporal_stats['max_over_time'] - opt_temporal_stats['max_over_time']) / 
+                          raster_temporal_stats['max_over_time'] * 100)
+        mean_improvement = ((raster_temporal_stats['mean_over_time'] - opt_temporal_stats['mean_over_time']) / 
+                          raster_temporal_stats['mean_over_time'] * 100)
+    
+        print(f"\nImprovements:")
+        print(f"  Max gradient reduction: {max_improvement:.2f}%")
+        print(f"  Mean gradient reduction: {mean_improvement:.2f}%")
+    
+        return fig
+    
+    # ===============================
+    # Animation Methods
+    # ===============================
+    
+    def animate_optimization_results(self, model, initial_params, optimized_params, 
+                                   fps=30, show_full_domain=True, y_crop=None, 
+                                   save_snapshots=True, snapshot_interval=0.01, 
+                                   snapshot_dir="animation_snapshots"):
         """
         Animate temperature evolution for raster and optimized scans.
         Shows laser positions and melt pool outlines at each frame.
-        Optionally saves snapshots at intervals.
+        
+        Args:
+            model: HeatTransferModel instance
+            initial_params: initial parameter dictionary
+            optimized_params: optimized parameter dictionary  
+            fps: animation frame rate
+            show_full_domain: show full domain (kept for compatibility)
+            y_crop: y-range for cropping (kept for compatibility)
+            save_snapshots: whether to save snapshot images
+            snapshot_interval: time interval for snapshots
+            snapshot_dir: directory for snapshot images
+            
+        Returns:
+            matplotlib.animation.FuncAnimation: animation object
         """
-        # Raster scan setup
-        x_start, x_end = 0, self.model.Lx
-        y_start = 0.0010
-        y_end = 0.0015
-        hatch_spacing = 0.00005
-        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
-        raster_speed = 0.2
-        raster_path, raster_v = self.generate_raster_scan(x_start, x_end, y_start, y_end, n_lines, raster_speed)
-
-        heat_params = (
-            {'Q': 200.0, 'r0': 0.00005},
-            {'Q': 200.0, 'r0': 0.00005}
+        # Setup animation components
+        animation_config = self._setup_animation_config(
+            initial_params, optimized_params, save_snapshots, 
+            snapshot_interval, snapshot_dir
         )
-        def raster_trajectory(t, params):
-            idx = int(t * raster_v * len(raster_path) / (x_end - x_start))
-            idx = np.clip(idx, 0, len(raster_path) - 1)
-            x, y = raster_path[idx]
-            return x, y, 1, 0
-
-        # Optimized scan setup
-        temp_optimizer = TrajectoryOptimizer(self.model, initial_params=initial_params, bounds=None)
-        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
-        laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
-        sawtooth_params, swirl_params = laser_opt
-
-        # Animation setup
-        dt = self.model.dt
-        nt = self.model.nt
-        t_points = np.linspace(0, nt * dt, nt)
-        colors = [(0, 0, 0.3), (0, 0, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0), (1, 1, 1)]
-        cmap_temp = LinearSegmentedColormap.from_list('thermal', colors)
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-        extent = [0, self.model.Lx * 1000, 0, self.model.Ly * 1000]
-
-        # Add inset axis for melt pool geometry
-        ax_inset = inset_axes(ax2, width="30%", height="30%", loc='lower left', borderpad=2, bbox_to_anchor=(0.08, 0.05, 0.4, 0.4), bbox_transform=ax2.transAxes)
-        ax_inset.set_title("Melt Pool Outline", fontsize=8)
-        ax_inset.set_xticks([])
-        ax_inset.set_yticks([])
-        ax_inset.set_xlim(0, self.model.Lx * 1000)
-        ax_inset.set_ylim(0, self.model.Ly * 1000)
-
-        # Initial temperature fields
-        T_raster = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
-        T_opt = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
-
-        temp_vmin = self.model.material['T0']
-        temp_vmax = 200
-
-        im1 = ax1.imshow(T_raster, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=temp_vmax)
-        ax1.set_title('Raster Scan Temperature')
-        ax1.set_xlabel('X (mm)')
-        ax1.set_ylabel('Y (mm)')
-        raster_laser_dot, = ax1.plot([], [], 'ko', markersize=6, label='Raster Laser')
-        ax1.legend()
-
-        im2 = ax2.imshow(T_opt, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=temp_vmax)
-        ax2.set_title('Optimized Scan Temperature')
-        ax2.set_xlabel('X (mm)')
-        ax2.set_ylabel('Y (mm)')
-        saw_dot, = ax2.plot([], [], 'ro', markersize=6, label='Sawtooth Laser')
-        swirl_dot, = ax2.plot([], [], 'ko', markersize=6, label='Swirl Laser')
-        ax2.legend()
-
-        plt.tight_layout()
-
-        # Precompute raster and optimized positions
-        raster_positions = [raster_trajectory(t, {'v': raster_v, 'A': 0, 'y0': 0, 'period': 1, 'noise_sigma': 0}) for t in t_points]
-        saw_positions = [self.model.sawtooth_trajectory(t, sawtooth_params) for t in t_points]
-        swirl_positions = [self.model.swirl_trajectory(t, swirl_params) for t in t_points]
-
-        # Setup for saving snapshots
-        if save_snapshots:
-            if not os.path.exists(snapshot_dir):
-                os.makedirs(snapshot_dir)
-            snapshot_frames = set()
-            total_time = nt * dt
-            snapshot_times = np.arange(0, total_time, snapshot_interval)
-            for snap_time in snapshot_times:
-                frame_idx = int(np.round(snap_time / dt))
-                if frame_idx < nt:
-                    snapshot_frames.add(frame_idx)
-
-        def update(frame):
-            # Clear axes for new frame
-            ax1.cla()
-            ax2.cla()
-
-            # Update temperature fields for raster scan
-            im1 = ax1.imshow(update.T_raster, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=5000)
-            ax1.set_title('Raster Scan Temperature')
-            ax1.set_xlabel('X (mm)')
-            ax1.set_ylabel('Y (mm)')
-
-            # Update temperature fields for optimized scan
-            im2 = ax2.imshow(update.T_opt, extent=extent, origin='lower', cmap=cmap_temp, aspect='auto', vmin=temp_vmin, vmax=5000)
-            ax2.set_title('Optimized Scan Temperature')
-            ax2.set_xlabel('X (mm)')
-            ax2.set_ylabel('Y (mm)')
-
-            # Update laser positions
-            raster_laser_dot, = ax1.plot([], [], 'ko', markersize=6, label='Raster Laser')
-            saw_dot, = ax2.plot([], [], 'ro', markersize=6, label='Sawtooth Laser')
-            swirl_dot, = ax2.plot([], [], 'ko', markersize=6, label='Swirl Laser')
-            ax1.legend()
-            ax2.legend()
-
-            # Raster scan update
-            frame_idx = frame
-            if frame_idx >= len(raster_path):
-                frame_idx = len(raster_path) - 1
-            x_r, y_r = raster_path[frame_idx]
-            S_r = self.model._gaussian_source(x_r, y_r, heat_params[0])
-            if frame == 0:
-                update.T_raster = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
-            lap_r = self.model._laplacian(update.T_raster)
-            update.T_raster = update.T_raster + dt * self.model.material['alpha'] * lap_r
-            update.T_raster = update.T_raster + dt * S_r / (self.model.dx * self.model.dy * self.model.thickness * self.model.material['rho'] * self.model.material['cp'])
-            update.T_raster[0, :] = self.model.material['T0']
-            update.T_raster[-1, :] = self.model.material['T0']
-            update.T_raster[:, 0] = self.model.material['T0']
-            update.T_raster[:, -1] = self.model.material['T0']
-            im1.set_array(update.T_raster)
-            raster_laser_dot.set_data([x_r * 1000], [y_r * 1000])
-
-            # Optimized scan update (dual-laser)
-            x_saw, y_saw, _, _ = saw_positions[frame]
-            x_swirl, y_swirl, _, _ = swirl_positions[frame]
-            S1 = self.model._gaussian_source(x_saw, y_saw, heat_opt[0])
-            S2 = self.model._gaussian_source(x_swirl, y_swirl, heat_opt[1])
-            S_total = S1 + S2
-            if frame == 0:
-                update.T_opt = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
-            lap_opt = self.model._laplacian(update.T_opt)
-            update.T_opt = update.T_opt + dt * self.model.material['alpha'] * lap_opt
-            update.T_opt = update.T_opt + dt * S_total / (self.model.dx * self.model.dy * self.model.thickness * self.model.material['rho'] * self.model.material['cp'])
-            update.T_opt[0, :] = self.model.material['T0']
-            update.T_opt[-1, :] = self.model.material['T0']
-            update.T_opt[:, 0] = self.model.material['T0']
-            update.T_opt[:, -1] = self.model.material['T0']
-            im2.set_array(update.T_opt)
-            saw_dot.set_data([x_saw * 1000], [y_saw * 1000])
-            swirl_dot.set_data([x_swirl * 1000], [y_swirl * 1000])
-
-            # Set temperature scale bar to fixed range
-            im1.set_clim(vmin=temp_vmin, vmax=5000)
-            im2.set_clim(vmin=temp_vmin, vmax=5000)
-
-            # Annotate max temperature for each subplot
-            max_temp_raster = np.max(update.T_raster)
-            max_temp_opt = np.max(update.T_opt)
-            update.raster_max_temp_text = ax1.text(
-                0.98, 0.02,
-                f"Max T: {max_temp_raster:.1f}°C",
-                transform=ax1.transAxes, fontsize=10, color='white', ha='right', va='bottom',
-                bbox=dict(facecolor='black', alpha=0.5, boxstyle='round')
-            )
-            update.opt_max_temp_text = ax2.text(
-                0.98, 0.02,
-                f"Max T: {max_temp_opt:.1f}°C",
-                transform=ax2.transAxes, fontsize=10, color='white', ha='right', va='bottom',
-                bbox=dict(facecolor='black', alpha=0.5, boxstyle='round')
-            )
-
-            # Melt pool outline in inset for optimized scan
-            ax_inset.clear()
-            ax_inset.set_title("Melt Pool Shape", fontsize=8, color='white')
-            inset_xlim = (-0.5, 0.5)
-            inset_ylim = (-0.5, 0.5)
-            ax_inset.set_xlim(inset_xlim)
-            ax_inset.set_ylim(inset_ylim)
-            ax_inset.set_aspect('equal')
-            ax_inset.set_xlabel("mm", fontsize=7, color='white', labelpad=2)
-            ax_inset.set_ylabel("mm", fontsize=7, color='white', labelpad=2)
-            ax_inset.tick_params(axis='both', which='major', labelsize=7, colors='white')
-            T_melt = self.model.material['T_melt']
-            melt_mask_opt = update.T_opt > T_melt
-
-            if np.any(melt_mask_opt):
-                contours = measure.find_contours(melt_mask_opt.astype(float), 0.5)
-                if contours:
-                    contour = max(contours, key=len)
-                    y_idx, x_idx = contour[:, 0], contour[:, 1]
-                    x_mm = np.interp(x_idx, np.arange(self.model.nx), np.linspace(0, self.model.Lx * 1e3, self.model.nx))
-                    y_mm = np.interp(y_idx, np.arange(self.model.ny), np.linspace(0, self.model.Ly * 1e3, self.model.ny))
-                    x_mm = x_mm - np.mean(x_mm)
-                    y_mm = y_mm - np.mean(y_mm)
-                    ax_inset.plot(x_mm, y_mm, color='cyan', linewidth=2)
-
-            # Melt pool outline in inset for raster scan
-            if not hasattr(update, "ax_inset_raster"):
-                update.ax_inset_raster = inset_axes(ax1, width="30%", height="30%", loc='lower left', borderpad=2, bbox_to_anchor=(0.08, 0.05, 0.4, 0.4), bbox_transform=ax1.transAxes)
-            ax_inset_raster = update.ax_inset_raster
-            ax_inset_raster.clear()
-            ax_inset_raster.set_title("Melt Pool Shape", fontsize=8, color='white')
-            ax_inset_raster.set_xlim(inset_xlim)
-            ax_inset_raster.set_ylim(inset_ylim)
-            ax_inset_raster.set_aspect('equal')
-            ax_inset_raster.set_xlabel("mm", fontsize=7, color='white', labelpad=2)
-            ax_inset_raster.set_ylabel("mm", fontsize=7, color='white', labelpad=2)
-            ax_inset_raster.tick_params(axis='both', which='major', labelsize=7, colors='white')
-            melt_mask_raster = update.T_raster > T_melt
-
-            if np.any(melt_mask_raster):
-                contours = measure.find_contours(melt_mask_raster.astype(float), 0.5)
-                if contours:
-                    contour = max(contours, key=len)
-                    y_idx, x_idx = contour[:, 0], contour[:, 1]
-                    x_mm = np.interp(x_idx, np.arange(self.model.nx), np.linspace(0, self.model.Lx * 1e3, self.model.nx))
-                    y_mm = np.interp(y_idx, np.arange(self.model.ny), np.linspace(0, self.model.Ly * 1e3, self.model.ny))
-                    x_mm = x_mm - np.mean(x_mm)
-                    y_mm = y_mm - np.mean(y_mm)
-                    ax_inset_raster.plot(x_mm, y_mm, color='cyan', linewidth=2)
-
-            # Save snapshot if required
-            if save_snapshots and frame in snapshot_frames:
-                fname = os.path.join(snapshot_dir, f"snapshot_{frame:05d}.png")
-                fig.savefig(fname)
-            return im1, raster_laser_dot, im2, saw_dot, swirl_dot
-
-        update.T_raster = T_raster.copy()
-        update.T_opt = T_opt.copy()
-
-        ani = FuncAnimation(fig, update, frames=nt, interval=1000 / fps, blit=False)
+        
+        # Create animation figure and axes
+        fig, axes_config = self._create_animation_figure()
+        
+        # Initialize animation data
+        animation_data = self._initialize_animation_data(animation_config)
+        
+        # Create update function
+        update_func = self._create_animation_update_function(
+            animation_config, axes_config, animation_data
+        )
+        
+        # Create and return animation
+        nt = animation_config['nt']
+        ani = FuncAnimation(fig, update_func, frames=nt, interval=1000/fps, blit=False)
+        
         plt.show()
         return ani
+    
+    def _setup_animation_config(self, initial_params, optimized_params, 
+                          save_snapshots, snapshot_interval, snapshot_dir):
+        """Setup configuration for animation with synchronized timing."""
+        # Raster scan configuration
+        raster_config = self._setup_raster_scan()
+        raster_speed = 0.2  # Raster scan speed
+        raster_config['speed'] = raster_speed
+    
+        # Optimized scan configuration
+        temp_optimizer = TrajectoryOptimizer(
+            self.model, initial_params=initial_params, bounds=None
+        )
+        optimized_array = temp_optimizer.parameters_to_array(optimized_params)
+        laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
+    
+        # FIXED: Calculate optimized scan speed to synchronize timing
+        # Extract the actual scan speed from optimized parameters
+        if isinstance(laser_opt, tuple):
+            # Multiple lasers - use slowest speed for timing
+            opt_speeds = [laser['params']['v'] for laser in laser_opt]
+            opt_speed = min(opt_speeds)
+        else:
+            # Single laser
+            opt_speed = laser_opt['params']['v']
+    
+        # FIXED: Calculate scan distances for both scans
+        x_start = raster_config['x_start']
+        x_end = raster_config['x_end']
+        scan_distance = x_end - x_start  # Distance to cover
+    
+        # Calculate time required for each scan to complete
+        raster_time = scan_distance / raster_speed
+        opt_time = scan_distance / opt_speed
+    
+        # Use the LONGER time as the animation duration to show full scans
+        animation_duration = max(raster_time, opt_time)
+    
+        # FIXED: Set time step and number of steps based on animation duration
+        # Use a reasonable frame rate (30-60 fps equivalent)
+        dt = animation_duration / 6000  # 6000 frames for smooth animation
+        nt = 6000
+    
+        print(f"\nAnimation Timing:")
+        print(f"  Raster scan speed: {raster_speed:.3f} m/s")
+        print(f"  Optimized scan speed: {opt_speed:.3f} m/s")
+        print(f"  Scan distance: {scan_distance*1000:.2f} mm")
+        print(f"  Raster scan time: {raster_time:.3f} s")
+        print(f"  Optimized scan time: {opt_time:.3f} s")
+        print(f"  Animation duration: {animation_duration:.3f} s")
+        print(f"  Time step (dt): {dt:.6f} s")
+        print(f"  Number of frames: {nt}")
+    
+        # Snapshot configuration
+        snapshot_frames = set()
+        if save_snapshots:
+            os.makedirs(snapshot_dir, exist_ok=True)
+            snapshot_frames = set(
+                int(i * nt * snapshot_interval) for i in range(int(1/snapshot_interval) + 1)
+            )
+    
+        return {
+            'raster_config': raster_config,
+            'laser_opt': laser_opt,
+            'heat_opt': heat_opt,
+            'dt': dt,
+            'nt': nt,
+            'animation_duration': animation_duration,
+            'raster_time': raster_time,
+            'opt_time': opt_time,
+            'raster_speed': raster_speed,
+            'opt_speed': opt_speed,
+            'snapshot_frames': snapshot_frames,
+            'snapshot_dir': snapshot_dir,
+            'save_snapshots': save_snapshots
+        }
+    
+    def _check_scan_completion(self, t, scan_time, speed, x_start, x_end):
+        """
+        Check if a scan has completed and return final position if so.
+    
+        Args:
+            t: current time
+            scan_time: total time for this scan
+            speed: scan speed
+            x_start, x_end: x-range
+        
+        Returns:
+            tuple: (is_complete, final_x, final_y)
+        """
+        if t >= scan_time:
+            # Scan is complete - hold at final position
+            return True, x_end, 0.0005  # Return to center y position
+        return False, None, None
+
+    def _create_animation_figure(self):
+        """Create figure and axes for animation."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # Create inset axes for melt pool visualization
+        ax_inset_opt = inset_axes(ax2, width="30%", height="30%", loc='lower left',
+                                 borderpad=2, bbox_to_anchor=(0.08, 0.05, 0.4, 0.4),
+                                 bbox_transform=ax2.transAxes)
+        ax_inset_opt.set_title("Melt Pool Outline", fontsize=8)
+        ax_inset_opt.set_xticks([])
+        ax_inset_opt.set_yticks([])
+        ax_inset_opt.set_xlim(0, self.model.Lx * 1000)
+        ax_inset_opt.set_ylim(0, self.model.Ly * 1000)
+        
+        return fig, {
+            'ax1': ax1,
+            'ax2': ax2,
+            'ax_inset_opt': ax_inset_opt,
+            'ax_inset_raster': None  # Will be created dynamically
+        }
+    
+    def _initialize_animation_data(self, config):
+        """Initialize temperature fields and other animation data."""
+        T_raster = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+        T_opt = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+    
+        # Extract laser positions and trajectories
+        laser_positions = self._extract_animation_laser_positions(config)
+    
+        # FIXED: Initialize path history arrays to track actual noisy positions
+        return {
+            'T_raster': T_raster,
+            'T_opt': T_opt,
+            'laser_positions': laser_positions,
+            'temp_vmin': self.model.material['T0'],
+            'temp_vmax': 5000,
+            'extent': [0, self.model.Lx * 1000, 0, self.model.Ly * 1000],
+            'raster_path_history': [],
+            'opt_path_history': []
+        }
+    
+    def _extract_animation_laser_positions(self, config):
+        """Extract laser positions for animation using corrected trajectory functions."""
+        nt = config['nt']
+        dt = config['dt']
+        t_points = np.linspace(0, nt * dt, nt)
+
+        # Raster positions using corrected mathematical approach
+        raster_trajectory = self._create_raster_trajectory_function(
+            config['raster_config']['path'], 
+            config['raster_config']['speed'],
+            config['raster_config']['x_end'],
+            config['raster_config']['x_start']
+        )
+
+        # Store the trajectory function for real-time calculation
+        raster_path_points = []
+        for t in t_points:
+            x, y, _, _ = raster_trajectory(t, {'v': config['raster_config']['speed'], 'noise_sigma': 0.0})
+            raster_path_points.append((x, y))
+
+        return {
+            'raster_trajectory': raster_trajectory,
+            'raster_path': raster_path_points,
+            'optimized_positions': []  # Not needed since we calculate positions on-the-fly
+        }
+    
+    def _create_animation_update_function(self, config, axes_config, animation_data):
+        """Create the animation update function."""
+        def update(frame):
+            # Clear axes
+            axes_config['ax1'].cla()
+            axes_config['ax2'].cla()
+            
+            # Update temperature fields
+            self._update_temperature_fields(frame, config, animation_data)
+            
+            # Plot updated fields
+            self._plot_animation_frame(frame, config, axes_config, animation_data)
+            
+            # Update melt pool insets
+            self._update_melt_pool_insets(frame, axes_config, animation_data)
+            
+            # Save snapshot if needed
+            if (config['save_snapshots'] and 
+                frame in config['snapshot_frames']):
+                self._save_animation_snapshot(frame, config)
+            
+            return []
+        
+        return update
+    
+    def _update_temperature_fields(self, frame, config, animation_data):
+        """Update temperature fields for current animation frame with truly continuous scanning."""
+        dt = config['dt']
+        t = frame * dt
+
+        # === INITIALIZE ON FIRST FRAME ===
+        if frame == 0:
+            animation_data['T_raster'] = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+            animation_data['T_opt'] = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
+        
+            # FIXED: Initialize noise states for optimized trajectories
+            self.model.reset()
+
+        # === RASTER SCAN UPDATE ===
+        S_raster_total = 0
+    
+        raster_complete, final_x, final_y = self._check_scan_completion(
+            t, config['raster_time'], config['raster_speed'],
+            config['raster_config']['x_start'], config['raster_config']['x_end']
+        )
+    
+        if raster_complete:
+            x_r, y_r = final_x, final_y
+        else:
+            # Calculate current position using trajectory function
+            x_r, y_r, _, _ = animation_data['laser_positions']['raster_trajectory'](
+                t, {'v': config['raster_config']['speed'], 'noise_sigma': 0.0}
+            )
+        
+            # Apply heat at current position
+            for heat_params in config['raster_config']['heat_params']:
+                S_r = self.model._gaussian_source(x_r, y_r, heat_params)
+                S_raster_total += S_r
+
+        # Heat equation update for raster
+        lap_r = self.model._laplacian(animation_data['T_raster'])
+        T_diff_r = animation_data['T_raster'] + dt * self.model.material['alpha'] * lap_r
+
+        volume_factor = self.model.dx * self.model.dy * self.model.thickness
+        source_increment_r = (dt * S_raster_total) / (volume_factor * self.model.heat_capacity)
+        T_new_r = T_diff_r + source_increment_r
+        animation_data['T_raster'] = self.model._apply_boundary_conditions(T_new_r)
+    
+        # === OPTIMIZED SCAN UPDATE WITH CONTINUOUS TRAJECTORY CALCULATION ===
+        S_opt_total = 0
+        heat_opt = config['heat_opt']
+
+        opt_complete, final_x_opt, final_y_opt = self._check_scan_completion(
+            t, config['opt_time'], config['opt_speed'],
+            config['raster_config']['x_start'], config['raster_config']['x_end']
+        )
+    
+        if not opt_complete:
+            if isinstance(config['laser_opt'], tuple):
+                # Multiple lasers - calculate each position at current time
+                for i, laser_config in enumerate(config['laser_opt']):
+                    # FIXED: Get position directly from trajectory function at time t
+                    # This automatically includes noise evolution up to time t
+                    if laser_config['type'] == 'straight':
+                        x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
+                    elif laser_config['type'] == 'sawtooth':
+                        x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
+                    else:  # swirl
+                        x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+                
+                    heat_params = heat_opt[i] if isinstance(heat_opt, (list, tuple)) else heat_opt
+                
+                    # Apply heat at current position
+                    S = self.model._gaussian_source(x, y, heat_params)
+                    S_opt_total += S
+            else:
+                # Single laser - calculate position at current time
+                laser_config = config['laser_opt']
+                if laser_config['type'] == 'straight':
+                    x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
+                elif laser_config['type'] == 'sawtooth':
+                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
+                else:  # swirl
+                    x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+            
+                # Apply heat at current position
+                S_opt_total = self.model._gaussian_source(x, y, heat_opt)
+
+        # Heat equation update for optimized scan
+        lap_opt = self.model._laplacian(animation_data['T_opt'])
+        T_diff_opt = animation_data['T_opt'] + dt * self.model.material['alpha'] * lap_opt
+
+        source_increment_opt = (dt * S_opt_total) / (volume_factor * self.model.heat_capacity)
+        T_new_opt = T_diff_opt + source_increment_opt
+
+        animation_data['T_opt'] = self.model._apply_boundary_conditions(T_new_opt)
+    
+    
+    def _plot_animation_frame(self, frame, config, axes_config, animation_data):
+        """Plot current animation frame with proper laser positions."""
+        extent = animation_data['extent']
+        vmin, vmax = animation_data['temp_vmin'], animation_data['temp_vmax']
+    
+        # Plot temperature fields
+        im1 = axes_config['ax1'].imshow(
+            animation_data['T_raster'], extent=extent, origin='lower',
+            cmap=self.cmap_temp, aspect='auto', vmin=vmin, vmax=vmax
+        )
+        axes_config['ax1'].set_title('Raster Scan Temperature')
+        axes_config['ax1'].set_xlabel('X (mm)')
+        axes_config['ax1'].set_ylabel('Y (mm)')
+    
+        im2 = axes_config['ax2'].imshow(
+            animation_data['T_opt'], extent=extent, origin='lower',
+            cmap=self.cmap_temp, aspect='auto', vmin=vmin, vmax=vmax
+        )
+        axes_config['ax2'].set_title('Optimized Scan Temperature')
+        axes_config['ax2'].set_xlabel('X (mm)')
+        axes_config['ax2'].set_ylabel('Y (mm)')
+    
+        # Add laser position markers using corrected trajectory functions
+        self._add_animation_laser_markers(frame, config, axes_config, animation_data)
+    
+        # Add temperature annotations
+        self._add_animation_temperature_annotations(axes_config, animation_data)
+    
+    def _add_animation_laser_markers(self, frame, config, axes_config, animation_data):
+        """Add laser position markers to animation frame using corrected positions."""
+        dt = config['dt']
+        t = frame * dt
+    
+        # Raster laser position using corrected trajectory
+        x_r, y_r, _, _ = animation_data['laser_positions']['raster_trajectory'](
+            t, {'v': config['raster_config']['speed'], 'noise_sigma': 0.0}
+        )
+        axes_config['ax1'].plot(x_r * 1000, y_r * 1000, 'ko', markersize=8, label='Raster Laser')
+    
+        # Optimized laser positions using corrected trajectories
+        colors = ['red', 'black']
+        color_codes = ['ro', 'ko']
+    
+        if isinstance(config['laser_opt'], tuple):
+            # Multiple lasers
+            for i, laser_config in enumerate(config['laser_opt']):
+                if laser_config['type'] == 'straight':
+                    x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
+                elif laser_config['type'] == 'sawtooth':
+                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
+                else:  # swirl
+                    x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+            
+                color_code = color_codes[i % len(color_codes)]
+                axes_config['ax2'].plot(x * 1000, y * 1000, color_code, markersize=8)
+        else:
+            # Single laser
+            laser_config = config['laser_opt']
+            if laser_config['type'] == 'straight':
+                x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
+            elif laser_config['type'] == 'sawtooth':
+                x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
+            else:  # swirl
+                x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+        
+            axes_config['ax2'].plot(x * 1000, y * 1000, 'ro', markersize=8)
+    
+        # Add legends
+        axes_config['ax1'].legend()
+        self._add_optimized_legend(axes_config['ax2'], config['laser_opt'], [])
+    
+    def _add_optimized_legend(self, ax, laser_opt, laser_positions):
+        """Add legend for optimized laser configuration with consistent coloring."""
+        colors = ['red', 'black']  # Heat Source 1: red, Heat Source 2: black
+        
+        if isinstance(laser_opt, tuple):
+            # Multiple lasers - use consistent numbering
+            for i, laser in enumerate(laser_opt):
+                if i < len(laser_positions):  # Only add legend if laser is active
+                    color = colors[i % len(colors)]
+                    label = f"Heat Source {i+1}: {laser['type'].capitalize()}"
+                    ax.plot([], [], marker='o', color=color, markersize=8, 
+                           linestyle='None', label=label)
+        else:
+            # Single laser
+            ax.plot([], [], marker='o', color='red', markersize=8, 
+                   linestyle='None', label=f"Heat Source 1: {laser_opt['type'].capitalize()}")
+        
+        ax.legend()
+    
+    def _add_animation_temperature_annotations(self, axes_config, animation_data):
+        """Add temperature annotations to animation frame."""
+        max_temp_raster = np.max(animation_data['T_raster'])
+        max_temp_opt = np.max(animation_data['T_opt'])
+        
+        axes_config['ax1'].text(
+            0.98, 0.02, f"Max T: {max_temp_raster:.1f}°C",
+            transform=axes_config['ax1'].transAxes, fontsize=10, color='white',
+            ha='right', va='bottom',
+            bbox=dict(facecolor='black', alpha=0.5, boxstyle='round')
+        )
+        
+        axes_config['ax2'].text(
+            0.98, 0.02, f"Max T: {max_temp_opt:.1f}°C",
+            transform=axes_config['ax2'].transAxes, fontsize=10, color='white',
+            ha='right', va='bottom',
+            bbox=dict(facecolor='black', alpha=0.5, boxstyle='round')
+        )
+    
+    def _update_melt_pool_insets(self, frame, axes_config, animation_data):
+        """Update melt pool shape insets."""
+        T_melt = self.model.material['T_melt']
+        inset_lims = (-0.5, 0.5)
+        
+        # Update optimized scan inset
+        self._update_single_melt_pool_inset(
+            axes_config['ax_inset_opt'], animation_data['T_opt'], 
+            T_melt, inset_lims, "Melt Pool Shape"
+        )
+        
+        # Create/update raster scan inset if needed
+        if axes_config['ax_inset_raster'] is None:
+            axes_config['ax_inset_raster'] = inset_axes(
+                axes_config['ax1'], width="30%", height="30%", loc='lower left',
+                borderpad=2, bbox_to_anchor=(0.08, 0.05, 0.4, 0.4),
+                bbox_transform=axes_config['ax1'].transAxes
+            )
+        
+        self._update_single_melt_pool_inset(
+            axes_config['ax_inset_raster'], animation_data['T_raster'],
+            T_melt, inset_lims, "Melt Pool Shape"
+        )
+    
+    def _update_single_melt_pool_inset(self, ax_inset, T_field, T_melt, inset_lims, title):
+        """Update a single melt pool inset."""
+        ax_inset.clear()
+        ax_inset.set_title(title, fontsize=8, color='white')
+        ax_inset.set_xlim(inset_lims)
+        ax_inset.set_ylim(inset_lims)
+        ax_inset.set_aspect('equal')
+        ax_inset.set_xlabel("mm", fontsize=7, color='white', labelpad=2)
+        ax_inset.set_ylabel("mm", fontsize=7, color='white', labelpad=2)
+        ax_inset.tick_params(axis='both', which='major', labelsize=7, colors='white')
+        
+        # Find and plot melt pool contour
+        melt_mask = T_field > T_melt
+        
+        if np.any(melt_mask):
+            contours = measure.find_contours(melt_mask.astype(float), 0.5)
+            if contours:
+                # Use largest contour
+                contour = max(contours, key=len)
+                y_idx, x_idx = contour[:, 0], contour[:, 1]
+                
+                # Convert indices to physical coordinates
+                x_mm = np.interp(x_idx, np.arange(self.model.nx), 
+                               np.linspace(0, self.model.Lx * 1e3, self.model.nx))
+                y_mm = np.interp(y_idx, np.arange(self.model.ny), 
+                               np.linspace(0, self.model.Ly * 1e3, self.model.ny))
+                
+                # Center the coordinates
+                x_mm = x_mm - np.mean(x_mm)
+                y_mm = y_mm - np.mean(y_mm)
+                
+                ax_inset.plot(x_mm, y_mm, color='cyan', linewidth=2)
+    
+    def _save_animation_snapshot(self, frame, config):
+        """Save animation snapshot if required."""
+        if config['save_snapshots']:
+            fname = os.path.join(config['snapshot_dir'], f"snapshot_{frame:05d}.png")
+            plt.gcf().savefig(fname, dpi=150, bbox_inches='tight')
 
 # ===============================
 # 4. Main Optimization Routine
 # ===============================
 
-def run_optimization():
-    # Set up material parameters for LPBF simulation
-    material_params = {
-        'T0': 21.0,                # Initial temperature (°C)
-        'alpha': 5e-6,             # Thermal diffusivity (m²/s)
-        'rho': 7800.0,             # Density (kg/m³)
-        'cp': 500.0,               # Specific heat capacity (J/kg·K)
-        'thickness':  0.00021,     # Plate thickness (m)
-        'T_melt': 1500.0,          # Melting temperature (°C)
-        'k': 20.0,                 # Thermal conductivity (W/m·K)
-        'absorptivity': 1,         # Laser absorptivity
-    }
+class OptimizationRunner:
+    """
+    Main optimization routine for LPBF laser trajectory optimization.
     
-    # Define simulation domain and grid
-    domain_size = (0.02, 0.0025)     # 20mm x 2.5mm domain
-    grid_size = (201, 26)            # Grid resolution
-    dt = 1e-4                        # Time step (s)
-
-    # Initialize heat transfer model
-    model = HeatTransferModel(
-        domain_size=domain_size,
-        grid_size=grid_size,
-        dt=dt,
-        material_params=material_params
-    )
+    Handles user interaction, parameter setup, optimization execution,
+    and result analysis for both single and dual laser configurations.
+    """
     
-    # Initial laser and path parameters
-    initial_params = {
-        'sawtooth_v': 0.05,         # Sawtooth scan speed (m/s)
-        'sawtooth_A': 0.0002,       # Sawtooth amplitude (m)
-        'sawtooth_y0': 0.00125,     # Sawtooth center position (m)
-        'sawtooth_period': 0.01,    # Sawtooth period (s)
-        'sawtooth_Q': 200.0,        # Sawtooth laser power (W)
-        'sawtooth_r0': 5e-5,        # Sawtooth beam radius (m)
-        'swirl_v': 0.05,            # Swirl scan speed (m/s)
-        'swirl_A': 0.0002,          # Swirl amplitude (m)
-        'swirl_y0': 0.00125,        # Swirl center position (m)
-        'swirl_fr': 20.0,           # Swirl frequency (Hz)
-        'swirl_Q': 200.0,           # Swirl laser power (W)
-        'swirl_r0': 5e-5,           # Swirl beam radius (m)
-        'noise_sigma': 0.000        # Initial noise (m)
-    }
-
-    # Parameter bounds for optimization
-    bounds = {
-        'sawtooth_v': (0.01, 0.1),
-        'swirl_v': (0.01, 0.1),
-        'sawtooth_A': (0.00005, 0.00025),
-        'swirl_A': (0.00005, 0.00025),
-        'sawtooth_period': (0.01, 0.05),
-        'swirl_fr': (5.0, 20.0),
-        'sawtooth_Q': (50.0, 500.0),
-        'swirl_Q': (50.0, 500.0),
-        'sawtooth_r0': (3e-5, 8e-5),
-        'swirl_r0': (3e-5, 8e-5),
-        'noise_sigma': (0.0, 0.0005)
-    }
-
-    # Create optimizer for laser trajectories
-    optimizer = TrajectoryOptimizer(
-        model=model,
-        initial_params=initial_params,
-        bounds=bounds,
-        x_range=(0.0025, 0.0175)  # Scan region (m)
-    )
+    def __init__(self):
+        """Initialize optimization runner with default configurations."""
+        self.model = None
+        self.optimizer = None
+        self.result = None
+        self.optimized_params = None
+        
+        # Default optimization settings
+        self.default_objective = 'standard'
+        self.default_method = 'Powell'
+        self.default_max_iterations = 1000
+        
+        # Objective function descriptions
+        self.objective_descriptions = {
+            'standard': "Minimizing the sum of squared temperature gradients (smoothness of temperature field).",
+            'thermal_uniformity': "Promoting thermal uniformity (variance in melt pool temperature and gradients).",
+            'max_gradient': "Minimizing the maximum temperature gradient (reducing hot spots).",
+            'path_focused': "Minimizing gradients along the laser paths (melt pool quality along scan).",
+            'max_temp_difference': "Minimizing the maximum temperature difference in the melt pool."
+        }
     
-    # Print optimization objective description
-    objective = 'standard'  # Choose objective type
-    method = 'Powell'       # Choose optimization method
-    objective_descriptions = {
-        'standard': "Minimizing the sum of squared temperature gradients (smoothness of temperature field).",
-        'thermal_uniformity': "Promoting thermal uniformity (variance in melt pool temperature and gradients).",
-        'max_gradient': "Minimizing the maximum temperature gradient (reducing hot spots).",
-        'path_focused': "Minimizing gradients along the laser paths (melt pool quality along scan).",
-        'max_temp_difference': "Minimizing the maximum temperature difference in the melt pool."
-    }
-    print("\n=============================================")
-    print("Starting Laser Path Optimization")
-    print("=============================================\n")
-    print(f"Optimization objective: {objective_descriptions.get(objective, 'Unknown objective')}")
-
-    # Run optimization and handle errors
-    try:
-        result, optimized_params = optimizer.optimize(
-            objective_type=objective,
-            method=method,
-            max_iterations=1000
+    # ===============================
+    # User Input Methods
+    # ===============================
+    
+    def get_user_configuration(self):
+        """
+        Collect user preferences for optimization configuration.
+        
+        Returns:
+            dict: configuration dictionary with user choices
+        """
+        config = {}
+        
+        # Get number of heat sources
+        config['num_sources'] = self._get_num_sources()
+        
+        # Get trajectory types based on number of sources
+        if config['num_sources'] == 2:
+            config['trajectory_types'] = self._get_dual_trajectories()
+        else:
+            config['trajectory_types'] = [self._get_single_trajectory()]
+        
+        return config
+    
+    def _get_num_sources(self):
+        """Get number of heat sources from user."""
+        while True:
+           
+            num_sources = input("Optimize for (1) single or (2) dual heat sources? Enter 1 or 2: ").strip()
+            if num_sources in ['1', '2']:
+                return int(num_sources)
+            print("Invalid input. Please enter 1 or 2.")
+    
+    def _get_single_trajectory(self):
+        """Get trajectory type for single laser configuration."""
+        print("\nSelect trajectory for optimization:")
+        print("1 - Straight")
+        print("2 - Sawtooth")
+        print("3 - Swirl")
+    
+        while True:
+            choice = input("Enter 1, 2, or 3: ").strip()
+            if choice == '1':
+                return 'straight'
+            elif choice == '2':
+                return 'sawtooth'
+            elif choice == '3':
+                return 'swirl'
+            print("Invalid input. Please enter 1, 2, or 3.")
+    
+    def _get_dual_trajectories(self):
+        """Get trajectory types for dual laser configuration."""
+        trajectories = []
+    
+        for source_num in [1, 2]:
+            print(f"\nSelect reference trajectory for heat source {source_num}:")
+            print("1 - Straight")
+            print("2 - Sawtooth")
+            print("3 - Swirl")
+        
+            while True:
+                choice = input("Enter 1, 2, or 3: ").strip()
+                if choice == '1':
+                    trajectories.append('straight')
+                    break
+                elif choice == '2':
+                    trajectories.append('sawtooth')
+                    break
+                elif choice == '3':
+                    trajectories.append('swirl')
+                    break
+                print("Invalid input. Please enter 1, 2, or 3.")
+    
+        return trajectories
+    
+    # ===============================
+    # Model Setup Methods
+    # ===============================
+    
+    def setup_model(self):
+        """
+        Initialize heat transfer model with LPBF-appropriate parameters.
+        
+        Returns:
+            HeatTransferModel: configured model instance
+        """
+        # Material parameters for LPBF simulation
+        material_params = self._get_material_parameters()
+        
+        # Domain and grid configuration
+        domain_config = self._get_domain_configuration()
+        
+        # Create and return model
+        return HeatTransferModel(
+            domain_size=domain_config['domain_size'],
+            grid_size=domain_config['grid_size'],
+            dt=domain_config['dt'],
+            material_params=material_params
         )
-        optimization_successful = result.success
-    except Exception as e:
-        print(f"Optimization failed with error: {str(e)}")
-        print("Falling back to derivative-free method (Nelder-Mead)")
-        result, optimized_params = optimizer.optimize(
-            objective_type=objective,
-            method='Nelder-Mead',
-            max_iterations=1000
-        )
-        optimization_successful = result.success
     
-    # Analyze and visualize results if optimization succeeded
-    if optimization_successful:
+    def _get_material_parameters(self):
+        """Get material parameters for LPBF simulation."""
+        return {
+            'T0': 21.0,                # Initial temperature (°C)
+            'alpha': 5e-6,             # Thermal diffusivity (m²/s)
+            'rho': 7800.0,             # Density (kg/m³)
+            'cp': 500.0,               # Specific heat capacity (J/(kg·K))
+            'k': 20.0,                 # Thermal conductivity (W/(m·K))
+            'T_melt': 1500.0,          # Melting temperature (°C)
+            'thickness': 0.02,      # Plate thickness (m)
+            'absorptivity': 1.0        # Absorptivity (fraction)
+        }
+    
+    def _get_domain_configuration(self):
+        """Get domain and discretization parameters."""
+        return {
+            'domain_size': (0.008, 0.001),     # Domain size (m)
+            'grid_size': (401, 51),            # Grid resolution
+            'dt': 1e-5                         # Time step (s)
+        }
+    
+    # ===============================
+    # Parameter Setup Methods
+    # ===============================
+    
+    def setup_parameters(self, config): 
+        """
+        Setup initial parameters and bounds based on user configuration.
+        
+        Args:
+            config: configuration dictionary from user input
+            
+        Returns:
+            tuple: (initial_params, bounds) dictionaries
+        """
+        if config['num_sources'] == 2:
+            return self._setup_dual_source_parameters(config['trajectory_types'])
+        else:
+            return self._setup_single_source_parameters(config['trajectory_types'][0])
+    
+    def _setup_single_source_parameters(self, trajectory_type):
+        """Setup parameters for single laser configuration."""
+        if trajectory_type == 'straight':
+            initial_params, bounds = self._get_straight_parameters()
+        elif trajectory_type == 'sawtooth':
+            initial_params, bounds = self._get_sawtooth_parameters()
+        else:  # swirl
+            initial_params, bounds = self._get_swirl_parameters()
+    
+        # Add noise parameter
+        initial_params['noise_sigma'] = 0.000
+        bounds['noise_sigma'] = (0.0, 0.0005)
+    
+        return initial_params, bounds
+
+    def _setup_dual_source_parameters(self, trajectory_types):
+        """Setup parameters for dual laser configuration."""
+        initial_params = {}
+        bounds = {}
+    
+        # Setup parameters for each heat source
+        for i, trajectory_type in enumerate(trajectory_types):
+            suffix = '' if i == 0 else '2'
+        
+            if trajectory_type == 'straight':
+                source_params, source_bounds = self._get_straight_parameters(suffix)
+            elif trajectory_type == 'sawtooth':
+                source_params, source_bounds = self._get_sawtooth_parameters(suffix)
+            else:  # swirl
+                source_params, source_bounds = self._get_swirl_parameters(suffix)
+        
+            initial_params.update(source_params)
+            bounds.update(source_bounds)
+    
+        # Add noise parameter
+        initial_params['noise_sigma'] = 0.000
+        bounds['noise_sigma'] = (0.0, 0.0005)
+    
+        return initial_params, bounds
+    
+    def _get_sawtooth_parameters(self, suffix=''):
+        """Get sawtooth trajectory parameters with optional suffix."""
+        prefix = f'sawtooth{suffix}'
+        
+        initial_params = {
+            f'{prefix}_v': 0.05,
+            f'{prefix}_A': 0.0002,
+            f'{prefix}_y0': 0.0005,
+            f'{prefix}_period': 0.01,
+            f'{prefix}_Q': 200.0,
+            f'{prefix}_r0': 4e-5,
+        }
+        
+        bounds = {
+            f'{prefix}_v': (0.01, 0.1),
+            f'{prefix}_A': (0.00005, 0.00025),
+            f'{prefix}_period': (0.01, 0.05),
+            f'{prefix}_Q': (50.0, 500.0),
+        }
+
+        # Add y0 as a fixed parameter (not optimized)
+        initial_params[f'{prefix}_y0'] = 0.0005
+        
+        return initial_params, bounds
+    
+    def _get_swirl_parameters(self, suffix=''):
+        """Get swirl trajectory parameters with optional suffix."""
+        prefix = f'swirl{suffix}'
+        
+        initial_params = {
+            f'{prefix}_v': 0.05,
+            f'{prefix}_A': 0.0002,
+            f'{prefix}_y0': 0.0005,
+            f'{prefix}_fr': 20.0,
+            f'{prefix}_Q': 200.0,
+            f'{prefix}_r0': 4e-5,
+        }
+        
+        bounds = {
+            f'{prefix}_v': (0.01, 0.1),
+            f'{prefix}_A': (0.00005, 0.00025),
+            f'{prefix}_fr': (5.0, 20.0),
+            f'{prefix}_Q': (50.0, 500.0),
+        }
+        
+        initial_params[f'{prefix}_y0'] = 0.0005
+    
+        return initial_params, bounds
+
+    def _get_straight_parameters(self, suffix=''):
+        """Get straight trajectory parameters with optional suffix."""
+        prefix = f'straight{suffix}'
+    
+        initial_params = {
+            f'{prefix}_v': 0.05,
+            f'{prefix}_y0': 0.0005,
+            f'{prefix}_Q': 200.0,
+            f'{prefix}_r0': 4e-5,
+        }
+    
+        bounds = {
+            f'{prefix}_v': (0.01, 0.06),
+            f'{prefix}_Q': (175.0, 250.0),
+        }
+
+        initial_params[f'{prefix}_y0'] = 0.0005
+    
+        return initial_params, bounds
+    
+    # ===============================
+    # Optimization Execution
+    # ===============================
+    
+    def run_optimization(self, model, initial_params, bounds):
+        """
+        Execute optimization with error handling and fallback methods.
+        
+        Args:
+            model: HeatTransferModel instance
+            initial_params: initial parameter dictionary
+            bounds: parameter bounds dictionary
+            
+        Returns:
+            tuple: (TrajectoryOptimizer, optimization_result, optimized_params)
+        """
+        # Create optimizer with updated scan region (2.5mm margins)
+        optimizer = TrajectoryOptimizer(
+            model=model,
+            initial_params=initial_params,
+            bounds=bounds,
+            x_range=(0.0015, model.Lx - 0.0015)  # 1.5mm margins on both sides
+        )
+        
+        # Print optimization information
+        self._print_optimization_header()
+        
+        # Attempt optimization with primary method
+        result, optimized_params = self._attempt_optimization(
+            optimizer, self.default_objective, self.default_method
+        )
+        
+        # Try fallback method if primary failed
+        if not result.success:
+            print(f"Primary method ({self.default_method}) failed. Trying fallback method...")
+            result, optimized_params = self._attempt_optimization(
+                optimizer, self.default_objective, 'Nelder-Mead'
+            )
+        
+        return optimizer, result, optimized_params
+    
+    def _print_optimization_header(self):
+        """Print optimization header information."""
+        print("\n=============================================")
+        print("Starting Laser Path Optimization")
+        print("=============================================\n")
+        
+        objective_desc = self.objective_descriptions.get(
+            self.default_objective, 'Unknown objective'
+        )
+        print(f"Optimization objective: {objective_desc}")
+    
+    def _attempt_optimization(self, optimizer, objective_type, method):
+        """
+        Attempt optimization with specified method and handle errors.
+        
+        Args:
+            optimizer: TrajectoryOptimizer instance
+            objective_type: type of objective function
+            method: optimization method
+            
+        Returns:
+            tuple: (result, optimized_params)
+        """
+        try:
+            result, optimized_params = optimizer.optimize(
+                objective_type=objective_type,
+                method=method,
+                max_iterations=self.default_max_iterations
+            )
+            return result, optimized_params
+        
+        except Exception as e:
+            print(f"Optimization failed with error: {str(e)}")
+            if method != 'Nelder-Mead':
+                print("Falling back to derivative-free method (Nelder-Mead)")
+                return optimizer.optimize(
+                    objective_type=objective_type,
+                    method='Nelder-Mead',
+                    max_iterations=self.default_max_iterations
+                )
+            else:
+                # If Nelder-Mead also fails, return failed result
+                from scipy.optimize import OptimizeResult
+                failed_result = OptimizeResult(
+                    success=False,
+                    message=f"All optimization methods failed: {str(e)}",
+                    x=optimizer.parameters_to_array(optimizer.initial_params)
+                )
+                return failed_result, optimizer.initial_params
+    
+    # ===============================
+    # Results Analysis
+    # ===============================
+    
+    def analyze_results(self, optimizer, result, optimized_params, initial_params):
+        """
+        Analyze and display optimization results.
+        
+        Args:
+            optimizer: TrajectoryOptimizer instance
+            result: optimization result
+            optimized_params: optimized parameter dictionary
+            initial_params: initial parameter dictionary
+        """
+        if result.success:
+            self._display_successful_results(
+                optimizer, optimized_params, initial_params
+            )
+        else:
+            self._display_failed_results(result)
+    
+    def _display_successful_results(self, optimizer, optimized_params, initial_params):
+        """Display results for successful optimization."""
         print("\n=============================================")
         print("Optimization Successful!")
         print("=============================================\n")
         
-        # Show improvement in objective function
-        initial_obj = optimizer.objective_thermal_uniformity(
-            optimizer.parameters_to_array(initial_params)
-        )
-        final_obj = optimizer.objective_thermal_uniformity(
-            optimizer.parameters_to_array(optimized_params)
-        )
-        improvement = (initial_obj - final_obj) / initial_obj *  100
-        print(f"Initial objective value: {initial_obj:.4e}")
-        print(f"Final objective value: {final_obj:.4e}")
-        print(f"Improvement: {improvement:.2f}%\n")
+        # Calculate and display improvement
+        self._display_objective_improvement(optimizer, optimized_params, initial_params)
         
-        # Print parameter changes
-        print("Parameter Comparison:")
-        print("---------------------------------------------")
-        print(f"{'Parameter':<15} {'Initial':<12} {'Optimized':<12} {'Change %':<10}")
-        print("---------------------------------------------")
-        for name in optimizer.param_names:
-            init_val = initial_params[name]
-            opt_val = optimized_params[name]
-            change = (opt_val - init_val) / init_val * 100 if init_val != 0 else float('inf')
-            print(f"{name:<15} {init_val:<12.6f} {opt_val:<12.6f} {change:<10.2f}")
-        
-        # Visualize simulation results
-        viz = Visualization(model)
-        print("\nGenerating comparison visualizations...")
-        viz.compare_simulations(initial_params, optimized_params)
-        
-        # Optionally animate results
-        create_animation = input("Generate animation of optimization results? (y/n): ").lower()
-        if create_animation == 'y':
-            print("Generating animation (this may take a while)...")
-            ani = viz.animate_optimization_results(
-                model, 
-                initial_params, 
-                optimized_params, 
-                fps=30,
-            )
-            
-        # Optionally perform sensitivity analysis
-        run_sensitivity = input("Perform sensitivity analysis of optimized solution? (y/n): ")
-        if run_sensitivity == 'y':
-            print("\nPerforming sensitivity analysis...")
-            sensitivity_data = optimizer.perform_sensitivity_analysis(
-                optimized_params, 
-                objective_type=objective
-            )
-        print("\nOptimization process complete!")
-    else:
+        # Display parameter changes
+        self._display_parameter_changes(optimizer, optimized_params, initial_params)
+    
+    def _display_failed_results(self, result):
+        """Display results for failed optimization."""
         print("\n=============================================")
         print("Optimization Failed")
         print("=============================================\n")
         print(f"Error message: {result.message}")
         print("Try with a different optimization method or adjust parameters.")
     
-    return model, optimizer, result, optimized_params
+    def _display_objective_improvement(self, optimizer, optimized_params, initial_params):
+        """Display improvement in objective function value."""
+        # Use thermal_uniformity as standard comparison metric
+        initial_obj = optimizer.objective_thermal_uniformity(
+            optimizer.parameters_to_array(initial_params)
+        )
+        final_obj = optimizer.objective_thermal_uniformity(
+            optimizer.parameters_to_array(optimized_params)
+        )
+        
+        improvement = (initial_obj - final_obj) / initial_obj * 100 if initial_obj != 0 else 0
+        
+        print(f"Initial objective value: {initial_obj:.4e}")
+        print(f"Final objective value: {final_obj:.4e}")
+        print(f"Improvement: {improvement:.2f}%\n")
+    
+    def _display_parameter_changes(self, optimizer, optimized_params, initial_params):
+        """Display table of parameter changes."""
+        print("Parameter Comparison:")
+        print("---------------------------------------------")
+        print(f"{'Parameter':<15} {'Initial':<12} {'Optimized':<12} {'Change %':<10}")
+        print("---------------------------------------------")
+        
+        for name in optimizer.param_names:
+            init_val = initial_params[name]
+            opt_val = optimized_params[name]
+            
+            # Calculate percentage change
+            if init_val != 0:
+                change = (opt_val - init_val) / init_val * 100
+            else:
+                change = float('inf') if opt_val != 0 else 0
+            
+            print(f"{name:<15} {init_val:<12.6f} {opt_val:<12.6f} {change:<10.2f}")
+    
+    # ===============================
+    # Visualization and Analysis
+    # ===============================
+    
+    def run_visualization_and_analysis(self, model, optimizer, result, 
+                                     optimized_params, initial_params):
+        """
+        Run visualization and optional analysis steps.
+        
+        Args:
+            model: HeatTransferModel instance
+            optimizer: TrajectoryOptimizer instance
+            result: optimization result
+            optimized_params: optimized parameter dictionary
+            initial_params: initial parameter dictionary
+        """
+        if not result.success:
+            return
+        
+        # Generate comparison visualizations
+        self._generate_comparison_plots(model, initial_params, optimized_params)
+        
+        # Optional animation
+        self._optional_animation(model, initial_params, optimized_params)
+        
+        # Optional sensitivity analysis
+        self._optional_sensitivity_analysis(optimizer, optimized_params)
+        
+        print("\nOptimization process complete!")
+    
+    def _generate_comparison_plots(self, model, initial_params, optimized_params):
+        """Generate comparison visualization plots."""
+        print("\nGenerating comparison visualizations...")
+        viz = Visualization(model)
+        viz.compare_simulations(initial_params, optimized_params)
+    
+        # Also generate temporal gradient evolution plot
+        create_temporal_plot = input("Generate temporal gradient evolution plot? (y/n): ").lower()
+        if create_temporal_plot == 'y':
+            print("Generating temporal gradient analysis...")
+        
+            # Run simulations to get temporal data
+            raster_config = viz._setup_raster_scan()
+            _, _, _, raster_temporal_stats = viz._simulate_raster_scan(raster_config)
+            _, _, _, opt_temporal_stats = viz._simulate_optimized_scan(
+                initial_params, optimized_params, True
+            )
+        
+            # Plot temporal evolution
+            viz.plot_temporal_gradients(raster_temporal_stats, opt_temporal_stats)
+    
+    def _optional_animation(self, model, initial_params, optimized_params):
+        """Optionally generate optimization results animation."""
+        create_animation = input("Generate animation of optimization results? (y/n): ").lower()
+        if create_animation == 'y':
+            print("Generating animation (this may take a while)...")
+            viz = Visualization(model)
+            ani = viz.animate_optimization_results(
+                model, 
+                initial_params, 
+                optimized_params, 
+                fps=30,
+            )
+    
+    def _optional_sensitivity_analysis(self, optimizer, optimized_params):
+        """Optionally perform sensitivity analysis."""
+        run_sensitivity = input("Perform sensitivity analysis of optimized solution? (y/n): ").lower()
+        if run_sensitivity == 'y':
+            print("\nPerforming sensitivity analysis...")
+            sensitivity_data = optimizer.perform_sensitivity_analysis(
+                optimized_params, 
+                objective_type=self.default_objective
+            )
+    
+    # ===============================
+    # Main Execution Method
+    # ===============================
+    
+    def execute(self):
+        """
+        Execute complete optimization workflow.
+        
+        Returns:
+            tuple: (model, optimizer, result, optimized_params) for further use
+        """
+        try:
+            # Get user configuration
+            config = self.get_user_configuration()
+            
+            # Setup model
+            self.model = self.setup_model()
+            
+            # Setup parameters
+            initial_params, bounds = self.setup_parameters(config)
+            
+            # Run optimization
+            self.optimizer, self.result, self.optimized_params = self.run_optimization(
+                self.model, initial_params, bounds
+            )
+            
+            # Analyze results
+            self.analyze_results(
+                self.optimizer, self.result, self.optimized_params, initial_params
+            )
+            
+            # Visualization and analysis
+            self.run_visualization_and_analysis(
+                self.model, self.optimizer, self.result, 
+                self.optimized_params, initial_params
+            )
+            
+            return self.model, self.optimizer, self.result, self.optimized_params
+            
+        except KeyboardInterrupt:
+            print("\nOptimization interrupted by user.")
+            return None, None, None, None
+        
+        except Exception as e:
+            print(f"\nUnexpected error during optimization: {str(e)}")
+            print("Please check your inputs and try again.")
+            return None, None, None, None
+
+
+def run_optimization():
+    """
+    Legacy function for backward compatibility.
+    
+    Returns:
+        tuple: (model, optimizer, result, optimized_params)
+    """
+    runner = OptimizationRunner()
+    return runner.execute()
 
 # ===============================
 # 5. G-code Output Utility
 # ===============================
 
-def output_optimized_gcode(optimizer, optimized_params, filename="optimized_scan.gcode"):
+class GCodeGenerator:
     """
-    Output the optimized scan path for both lasers as G-code.
+    G-code generation utility for optimized laser trajectories.
+    
+    Converts optimized laser paths to G-code format suitable for
+    CNC machines or laser systems with proper formatting and metadata.
+    """
+    
+    def __init__(self, units='mm', positioning='absolute'):
+        """
+        Initialize G-code generator with configuration settings.
+        
+        Args:
+            units: 'mm' or 'inch' for coordinate units
+            positioning: 'absolute' or 'relative' positioning mode
+        """
+        self.units = units
+        self.positioning = positioning
+        
+        # G-code configuration
+        self.config = {
+            'units_code': 'G21' if units == 'mm' else 'G20',
+            'positioning_code': 'G90' if positioning == 'absolute' else 'G91',
+            'feedrate_default': 1000,  # mm/min or in/min
+            'laser_power_max': 255,    # Maximum laser power
+            'precision': 3             # Decimal places for coordinates
+        }
+        
+        # Trajectory metadata
+        self.trajectory_info = {}
+    
+    # ===============================
+    # Path Processing Methods
+    # ===============================
+    
+    def generate_gcode(self, optimizer, optimized_params, filename="optimized_scan.gcode", 
+                      include_metadata=True, separate_trajectories=False):
+        """
+        Generate G-code file from optimized laser parameters.
+        
+        Args:
+            optimizer: TrajectoryOptimizer instance
+            optimized_params: dictionary of optimized parameters
+            filename: output G-code filename
+            include_metadata: whether to include parameter metadata in comments
+            separate_trajectories: whether to output separate files for each trajectory
+            
+        Returns:
+            str or list: filename(s) of generated G-code file(s)
+        """
+        # Extract laser parameters
+        params_array = optimizer.parameters_to_array(optimized_params)
+        laser_params, heat_params = optimizer.unpack_parameters(params_array)
+        
+        # Process trajectories
+        trajectory_data = self._process_trajectories(optimizer, laser_params, heat_params)
+        
+        if separate_trajectories and len(trajectory_data) > 1:
+            return self._generate_separate_files(
+                trajectory_data, filename, optimized_params, include_metadata
+            )
+        else:
+            return self._generate_combined_file(
+                trajectory_data, filename, optimized_params, include_metadata
+            )
+    
+    def _process_trajectories(self, optimizer, laser_params, heat_params):
+        """
+        Process laser trajectories and generate path data.
+        
+        Args:
+            optimizer: TrajectoryOptimizer instance
+            laser_params: laser trajectory parameters
+            heat_params: heat source parameters
+            
+        Returns:
+            list: trajectory data dictionaries
+        """
+        trajectory_data = []
+        x_start, x_end = optimizer.x_range
+        
+        # Handle single or dual laser configuration
+        if isinstance(laser_params, tuple):
+            # Multiple lasers
+            for i, laser in enumerate(laser_params):
+                heat_param = heat_params[i] if isinstance(heat_params, tuple) else heat_params
+                traj_data = self._process_single_trajectory(
+                    optimizer, laser, heat_param, x_start, x_end, i + 1
+                )
+                trajectory_data.append(traj_data)
+        else:
+            # Single laser
+            traj_data = self._process_single_trajectory(
+                optimizer, laser_params, heat_params, x_start, x_end, 1
+            )
+            trajectory_data.append(traj_data)
+        
+        return trajectory_data
+    
+    def _process_single_trajectory(self, optimizer, laser_params, heat_params, 
+                                 x_start, x_end, laser_id):
+        """
+        Process a single laser trajectory.
+        
+        Args:
+            optimizer: TrajectoryOptimizer instance
+            laser_params: single laser parameters
+            heat_params: heat source parameters
+            x_start, x_end: x-range for trajectory
+            laser_id: identifier for this laser
+            
+        Returns:
+            dict: trajectory data
+        """
+        trajectory_type = laser_params['type']
+        params = laser_params['params']
+        
+        # Calculate trajectory points
+        dt = 1e-5  # Time step for trajectory sampling
+        v = params['v']
+        total_time = (x_end - x_start) / v
+        t_points = np.arange(0, total_time, dt)
+        
+        # Generate path points
+        if trajectory_type == 'straight':
+            path_points = np.array([
+                optimizer.model.straight_trajectory(t, params)[:2] 
+                for t in t_points
+            ])
+        elif trajectory_type == 'sawtooth':
+            path_points = np.array([
+                optimizer.model.sawtooth_trajectory(t, params)[:2] 
+                for t in t_points
+            ])
+        else:  # swirl
+            path_points = np.array([
+                optimizer.model.swirl_trajectory(t, params)[:2] 
+                for t in t_points
+            ])
+        
+        # Resample path for consistent speed
+        resampled_path = self._resample_path_constant_speed(path_points, v, dt)
+        
+        # Calculate feedrate and laser power
+        feedrate = self._calculate_feedrate(v)
+        laser_power = self._calculate_laser_power(heat_params)
+        
+        # Store trajectory metadata
+        self.trajectory_info[f'laser_{laser_id}'] = {
+            'type': trajectory_type,
+            'velocity': v,
+            'power': heat_params.get('Q', 200.0),
+            'spot_size': heat_params.get('r0', 8e-5),
+            'points_count': len(resampled_path),
+            'path_length': self._calculate_path_length(resampled_path)
+        }
+        
+        return {
+            'id': laser_id,
+            'type': trajectory_type,
+            'path': resampled_path,
+            'feedrate': feedrate,
+            'laser_power': laser_power,
+            'params': params,
+            'heat_params': heat_params
+        }
+    
+    def _resample_path_constant_speed(self, path, velocity, dt):
+        """
+        Resample path to maintain constant speed between points.
+        
+        Args:
+            path: array of (x, y) coordinates
+            velocity: target velocity (m/s)
+            dt: time step
+            
+        Returns:
+            numpy.ndarray: resampled path points
+        """
+        if len(path) < 2:
+            return path
+        
+        # Calculate cumulative arc length
+        diffs = np.diff(path, axis=0)
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        arc_lengths = np.concatenate([[0], np.cumsum(segment_lengths)])
+        total_length = arc_lengths[-1]
+        
+        # Calculate number of points for constant speed
+        target_distance = velocity * dt
+        n_points = max(2, int(np.ceil(total_length / target_distance)))
+        
+        # Create target arc lengths
+        target_lengths = np.linspace(0, total_length, n_points)
+        
+        # Interpolate coordinates
+        x_resampled = np.interp(target_lengths, arc_lengths, path[:, 0])
+        y_resampled = np.interp(target_lengths, arc_lengths, path[:, 1])
+        
+        return np.column_stack([x_resampled, y_resampled])
+    
+    def _calculate_feedrate(self, velocity_ms):
+        """
+        Convert velocity from m/s to appropriate feedrate units.
+        
+        Args:
+            velocity_ms: velocity in m/s
+            
+        Returns:
+            float: feedrate in mm/min or in/min
+        """
+        if self.units == 'mm':
+            # Convert m/s to mm/min
+            feedrate = velocity_ms * 1000 * 60
+        else:  # inches
+            # Convert m/s to in/min
+            feedrate = velocity_ms * 39.3701 * 60
+        
+        return round(feedrate, 1)
+    
+    def _calculate_laser_power(self, heat_params):
+        """
+        Calculate laser power setting from heat parameters.
+        
+        Args:
+            heat_params: heat source parameters
+            
+        Returns:
+            int: laser power setting (0-255 range)
+        """
+        power_watts = heat_params.get('Q', 200.0)
+        max_power = 500.0  # Assumed maximum power in watts
+        
+        # Scale to 0-255 range
+        power_setting = int((power_watts / max_power) * self.config['laser_power_max'])
+        return max(1, min(power_setting, self.config['laser_power_max']))
+    
+    def _calculate_path_length(self, path):
+        """Calculate total path length in meters."""
+        if len(path) < 2:
+            return 0.0
+        
+        diffs = np.diff(path, axis=0)
+        segment_lengths = np.linalg.norm(diffs, axis=1)
+        return np.sum(segment_lengths)
+    
+    # ===============================
+    # G-code Generation Methods
+    # ===============================
+    
+    def _generate_combined_file(self, trajectory_data, filename, optimized_params, include_metadata):
+        """Generate single G-code file with all trajectories."""
+        with open(filename, 'w') as f:
+            # Write header
+            self._write_gcode_header(f, optimized_params, include_metadata)
+            
+            # Write trajectories
+            for i, traj_data in enumerate(trajectory_data):
+                self._write_trajectory_gcode(f, traj_data, i + 1)
+            
+            # Write footer
+            self._write_gcode_footer(f)
+        
+        print(f"G-code written to {filename}")
+        self._print_generation_summary(trajectory_data, filename)
+        
+        return filename
+    
+    def _generate_separate_files(self, trajectory_data, base_filename, optimized_params, include_metadata):
+        """Generate separate G-code files for each trajectory."""
+        generated_files = []
+        base_name, ext = os.path.splitext(base_filename)
+        
+        for i, traj_data in enumerate(trajectory_data):
+            filename = f"{base_name}_laser{traj_data['id']}{ext}"
+            
+            with open(filename, 'w') as f:
+                # Write header
+                self._write_gcode_header(f, optimized_params, include_metadata, traj_data['id'])
+                
+                # Write single trajectory
+                self._write_trajectory_gcode(f, traj_data, traj_data['id'])
+                
+                # Write footer
+                self._write_gcode_footer(f)
+            
+            generated_files.append(filename)
+            print(f"G-code written to {filename}")
+        
+        self._print_generation_summary(trajectory_data, generated_files)
+        return generated_files
+    
+    def _write_gcode_header(self, file, optimized_params, include_metadata, laser_id=None):
+        """Write G-code file header with setup commands and metadata."""
+        file.write("; ===============================================\n")
+        if laser_id:
+            file.write(f"; Optimized Laser Trajectory G-code - Laser {laser_id}\n")
+        else:
+            file.write("; Optimized Laser Trajectory G-code\n")
+        file.write("; Generated by LPBF Trajectory Optimizer\n")
+        file.write(f"; Generated on: {self._get_timestamp()}\n")
+        file.write("; ===============================================\n\n")
+        
+        # Include parameter metadata if requested
+        if include_metadata:
+            self._write_parameter_metadata(file, optimized_params, laser_id)
+        
+        # Setup commands
+        file.write("; Setup commands\n")
+        file.write(f"{self.config['units_code']} ; Set units to {self.units}\n")
+        file.write(f"{self.config['positioning_code']} ; Set {'absolute' if self.positioning == 'absolute' else 'relative'} positioning\n")
+        file.write("G94 ; Set feedrate per minute mode\n")
+        file.write("M3 ; Spindle/Laser enable\n\n")
+    
+    def _write_parameter_metadata(self, file, optimized_params, laser_id=None):
+        """Write optimized parameters as G-code comments."""
+        file.write("; Optimized Parameters:\n")
+        
+        if laser_id:
+            # Filter parameters for specific laser
+            relevant_params = {k: v for k, v in optimized_params.items() 
+                             if f'laser_{laser_id}' in self.trajectory_info or 
+                                (laser_id == 1 and not any(c in k for c in ['2']))}
+        else:
+            relevant_params = optimized_params
+        
+        for param, value in relevant_params.items():
+            if isinstance(value, float):
+                file.write(f"; {param}: {value:.6f}\n")
+            else:
+                file.write(f"; {param}: {value}\n")
+        
+        file.write(";\n")
+        
+        # Write trajectory information
+        for laser_key, info in self.trajectory_info.items():
+            if laser_id is None or laser_key == f'laser_{laser_id}':
+                file.write(f"; {laser_key.replace('_', ' ').title()} Information:\n")
+                file.write(f";   Type: {info['type'].capitalize()}\n")
+                file.write(f";   Velocity: {info['velocity']:.6f} m/s\n")
+                file.write(f";   Power: {info['power']:.1f} W\n")
+                file.write(f";   Spot Size: {info['spot_size']*1000:.3f} mm\n")
+                file.write(f";   Path Length: {info['path_length']*1000:.2f} mm\n")
+                file.write(f";   Points Count: {info['points_count']}\n")
+                file.write(";\n")
+    
+    def _write_trajectory_gcode(self, file, traj_data, trajectory_num):
+        """Write G-code commands for a single trajectory."""
+        trajectory_type = traj_data['type']
+        path = traj_data['path']
+        feedrate = traj_data['feedrate']
+        laser_power = traj_data['laser_power']
+        
+        file.write(f"; {trajectory_type.capitalize()} trajectory - Laser {trajectory_num}\n")
+        file.write(f"F{feedrate:.1f} ; Set feedrate\n")
+        file.write(f"S{laser_power} ; Set laser power\n")
+        
+        # Convert coordinates to appropriate units
+        unit_multiplier = 1000 if self.units == 'mm' else 39.3701
+        precision = self.config['precision']
+        
+        # Move to start position (rapid move)
+        x_start, y_start = path[0] * unit_multiplier
+        file.write(f"G0 X{x_start:.{precision}f} Y{y_start:.{precision}f} ; Rapid to start\n")
+        file.write("M3 ; Laser ON\n")
+        
+        # Write path points
+        for i, (x, y) in enumerate(path[1:], 1):
+            x_coord = x * unit_multiplier
+            y_coord = y * unit_multiplier
+            
+            file.write(f"G1 X{x_coord:.{precision}f} Y{y_coord:.{precision}f}")
+            
+            # Add comments for key points
+            if i == 1:
+                file.write(" ; Start trajectory")
+            elif i == len(path) - 1:
+                file.write(" ; End trajectory")
+            elif i % 100 == 0:
+                file.write(f" ; Point {i}")
+            
+            file.write("\n")
+        
+        file.write("M5 ; Laser OFF\n")
+        file.write("G0 Z5 ; Lift Z (if applicable)\n\n")
+    
+    def _write_gcode_footer(self, file):
+        """Write G-code file footer with cleanup commands."""
+        file.write("; Cleanup commands\n")
+        file.write("M5 ; Laser OFF\n")
+        file.write("G0 X0 Y0 ; Return to origin\n")
+        file.write("M30 ; Program end\n")
+        file.write("\n; End of G-code\n")
+    
+    # ===============================
+    # Utility Methods
+    # ===============================
+    
+    def _get_timestamp(self):
+        """Get current timestamp for file header."""
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def _print_generation_summary(self, trajectory_data, filenames):
+        """Print summary of G-code generation."""
+        print("\n" + "="*50)
+        print("G-code Generation Summary")
+        print("="*50)
+        
+        if isinstance(filenames, list):
+            print(f"Generated {len(filenames)} files:")
+            for filename in filenames:
+                print(f"  - {filename}")
+        else:
+            print(f"Generated file: {filenames}")
+        
+        print(f"\nTrajectory Summary:")
+        total_length = 0
+        total_points = 0
+        
+        for traj_data in trajectory_data:
+            laser_id = traj_data['id']
+            traj_type = traj_data['type']
+            info = self.trajectory_info[f'laser_{laser_id}']
+            
+            print(f"  Laser {laser_id} ({traj_type.capitalize()}):")
+            print(f"    - Path length: {info['path_length']*1000:.2f} mm")
+            print(f"    - Points: {info['points_count']}")
+            print(f"    - Velocity: {info['velocity']:.3f} m/s")
+            print(f"    - Power: {info['power']:.1f} W")
+            
+            total_length += info['path_length']
+            total_points += info['points_count']
+        
+        print(f"\nTotal path length: {total_length*1000:.2f} mm")
+        print(f"Total points: {total_points}")
+        print(f"Units: {self.units}")
+        print(f"Positioning: {self.positioning}")
+    
+    # ===============================
+    # Validation Methods
+    # ===============================
+    
+    def validate_gcode(self, filename):
+        """
+        Perform basic validation of generated G-code file.
+        
+        Args:
+            filename: G-code file to validate
+            
+        Returns:
+            dict: validation results
+        """
+        validation_results = {
+            'valid': True,
+            'warnings': [],
+            'errors': [],
+            'stats': {}
+        }
+        
+        try:
+            with open(filename, 'r') as f:
+                lines = f.readlines()
+            
+            # Basic validation checks
+            self._validate_gcode_structure(lines, validation_results)
+            self._validate_gcode_coordinates(lines, validation_results)
+            self._calculate_gcode_stats(lines, validation_results)
+            
+        except Exception as e:
+            validation_results['valid'] = False
+            validation_results['errors'].append(f"Failed to validate file: {str(e)}")
+        
+        return validation_results
+    
+    def _validate_gcode_structure(self, lines, results):
+        """Validate basic G-code structure."""
+        has_start = any('M3' in line for line in lines)
+        has_end = any('M5' in line or 'M30' in line for line in lines)
+        
+        if not has_start:
+            results['warnings'].append("No laser/spindle start command (M3) found")
+        
+        if not has_end:
+            results['warnings'].append("No program end command (M5/M30) found")
+    
+    def _validate_gcode_coordinates(self, lines, results):
+        """Validate coordinate values are reasonable."""
+        coords = []
+        for line in lines:
+            if line.startswith('G0') or line.startswith('G1'):
+                # Extract X and Y coordinates
+                try:
+                    if 'X' in line and 'Y' in line:
+                        x_pos = line.find('X') + 1
+                        y_pos = line.find('Y') + 1
+                        
+                        x_end = min([i for i in [line.find(' ', x_pos), line.find(';', x_pos), len(line)] if i > x_pos])
+                        y_end = min([i for i in [line.find(' ', y_pos), line.find(';', y_pos), len(line)] if i > y_pos])
+                        
+                        x_val = float(line[x_pos:x_end])
+                        y_val = float(line[y_pos:y_end])
+                        coords.append((x_val, y_val))
+                except:
+                    continue
+        
+        if coords:
+            x_coords, y_coords = zip(*coords)
+            x_range = max(x_coords) - min(x_coords)
+            y_range = max(y_coords) - min(y_coords)
+            
+            # Check for reasonable coordinate ranges
+            max_reasonable = 1000 if self.units == 'mm' else 40  # mm or inches
+            
+            if x_range > max_reasonable or y_range > max_reasonable:
+                results['warnings'].append(f"Large coordinate range detected: X={x_range:.1f}, Y={y_range:.1f}")
+    
+    def _calculate_gcode_stats(self, lines, results):
+        """Calculate G-code file statistics."""
+        results['stats'] = {
+            'total_lines': len(lines),
+            'comment_lines': len([l for l in lines if l.strip().startswith(';')]),
+            'move_commands': len([l for l in lines if l.strip().startswith(('G0', 'G1'))]),
+            'laser_commands': len([l for l in lines if 'M3' in l or 'M5' in l])
+        }
+
+def output_optimized_gcode(optimizer, optimized_params, filename="optimized_scan.gcode", 
+                          units='mm', separate_files=False, include_metadata=True, validate=True):
+    """
+    Legacy function for backward compatibility with improved functionality.
+    
     Args:
         optimizer: TrajectoryOptimizer instance
-        optimized_params: dict of optimized parameters
+        optimized_params: dictionary of optimized parameters
         filename: output G-code filename
+        units: 'mm' or 'inch' for coordinate units
+        separate_files: whether to create separate files for each laser
+        include_metadata: whether to include parameter metadata
+        validate: whether to validate generated G-code
+    
+    Returns:
+        str or list: filename(s) of generated G-code file(s)
     """
-    # Unpack optimized parameters
-    params_array = optimizer.parameters_to_array(optimized_params)
-    laser_params, _ = optimizer.unpack_parameters(params_array)
-    sawtooth_params, swirl_params = laser_params
+    # Create G-code generator
+    generator = GCodeGenerator(units=units, positioning='absolute')
+    
+    # Generate G-code
+    generated_files = generator.generate_gcode(
+        optimizer, 
+        optimized_params, 
+        filename,
+        include_metadata=include_metadata,
+        separate_trajectories=separate_files
+    )
+    
+    # Validate generated files if requested
+    if validate:
+        files_to_validate = generated_files if isinstance(generated_files, list) else [generated_files]
+        
+        for gcode_file in files_to_validate:
+            validation_results = generator.validate_gcode(gcode_file)
+            
+            if validation_results['errors']:
+                print(f"\nValidation errors for {gcode_file}:")
+                for error in validation_results['errors']:
+                    print(f"  - {error}")
+            
+            if validation_results['warnings']:
+                print(f"\nValidation warnings for {gcode_file}:")
+                for warning in validation_results['warnings']:
+                    print(f"  - {warning}")
+            
+            if validation_results['valid'] and not validation_results['errors']:
+                print(f"\n✓ {gcode_file} validated successfully")
+    
+    return generated_files
 
-    # Helper to resample a path at constant arc length intervals
-    def resample_path(path, v, dt=1e-5):
-        diffs = np.diff(path, axis=0)
-        seg_lengths = np.linalg.norm(diffs, axis=1)
-        arc_length = np.concatenate([[0], np.cumsum(seg_lengths)])
-        total_length = arc_length[-1]
-        n_points = int(np.ceil(total_length / (v * dt)))
-        if n_points < 2:
-            n_points = 2
-        target_lengths = np.linspace(0, total_length, n_points)
-        x = np.interp(target_lengths, arc_length, path[:, 0])
-        y = np.interp(target_lengths, arc_length, path[:, 1])
-        return np.stack([x, y], axis=1)
 
-    # Generate scan paths for both lasers
-    x_start, x_end = optimizer.x_range
-    v1 = sawtooth_params['v']
-    v2 = swirl_params['v']
-    dt = 1e-5
-    total_time = max((x_end - x_start) / v1, (x_end - x_start) / v2)
-    t_points = np.arange(0, total_time, dt)
-    saw_path = np.array([optimizer.model.sawtooth_trajectory(t, sawtooth_params)[:2] for t in t_points])
-    swirl_path = np.array([optimizer.model.swirl_trajectory(t, swirl_params)[:2] for t in t_points])
-    saw_path_resampled = resample_path(saw_path, v1, dt)
-    swirl_path_resampled = resample_path(swirl_path, v2, dt)
+# ===============================
+# Enhanced Main Execution
+# ===============================
 
-    # Write G-code file
-    with open(filename, 'w') as f:
-        f.write("; Optimized dual-laser scan G-code\n")
-        f.write("G21 ; Set units to mm\n")
-        f.write("G90 ; Absolute positioning\n")
-        f.write("M3 S255 ; Laser ON (example)\n")
-        f.write("; Sawtooth laser path\n")
-        for x, y in saw_path_resampled * 1000:  # convert to mm
-            f.write(f"G1 X{x:.3f} Y{y:.3f} ; Sawtooth\n")
-        f.write("; Swirl laser path\n")
-        for x, y in swirl_path_resampled * 1000:
-            f.write(f"G1 X{x:.3f} Y{y:.3f} ; Swirl\n")
-        f.write("M5 ; Laser OFF\n")
-    print(f"G-code written to {filename}")
-
-# Run optimization and optionally export G-code if script is executed directly
 if __name__ == "__main__":
+    # Run optimization
     model, optimizer, result, optimized_params = run_optimization()
-    user_input = input("\nWould you like to output the optimized scan as G-code? (y/n): ").strip().lower()
-    if user_input == 'y':
-        output_optimized_gcode(optimizer, optimized_params)
+    
+    # Enhanced G-code export with options
+    if model and optimizer and result and optimized_params and result.success:
+        print("\n" + "="*50)
+        print("G-code Export Options")
+        print("="*50)
+        
+        export_gcode = input("Would you like to export G-code? (y/n): ").strip().lower()
+        
+        if export_gcode == 'y':
+            # Get export options
+            filename = input("Enter filename (default: optimized_scan.gcode): ").strip()
+            if not filename:
+                filename = "optimized_scan.gcode"
+            
+            units = input("Select units - (1) mm or (2) inches (default: mm): ").strip()
+            units = 'inch' if units == '2' else 'mm'
+            
+            separate = input("Create separate files for each laser? (y/n, default: n): ").strip().lower()
+            separate_files = separate == 'y'
+            
+            metadata = input("Include parameter metadata in comments? (y/n, default: y): ").strip().lower()
+            include_metadata = metadata != 'n'
+            
+            # Generate G-code
+            try:
+                generated_files = output_optimized_gcode(
+                    optimizer, 
+                    optimized_params, 
+                    filename,
+                    units=units,
+                    separate_files=separate_files,
+                    include_metadata=include_metadata,
+                    validate=True
+                )
+                
+                print(f"\n✓ G-code export completed successfully!")
+                
+            except Exception as e:
+                print(f"\n✗ G-code export failed: {str(e)}")
+        else:
+            print("G-code export skipped.")
     else:
-        print("G-code export skipped.")
+        print("G-code export not available - optimization was not successful or incomplete.")
