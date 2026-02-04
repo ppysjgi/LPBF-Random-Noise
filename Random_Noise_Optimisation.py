@@ -3256,29 +3256,26 @@ def run_optimization():
 # 5. G-code Output Utility
 # ===============================
 
-class GCodeGenerator:
+class CLIGenerator:
     """
-    G-code generation for optimized laser trajectories.
+    CLI+ file generation for optimized laser trajectories.
     """
     
-    def __init__(self, units='mm', positioning='absolute'):
+    def __init__(self, layer_thickness=0.03):
         """
-        Initialize G-code generator with configuration settings.
+        Initialize CLI+ generator with configuration settings.
         
         Args:
-            units: 'mm' or 'inch' for coordinate units
-            positioning: 'absolute' or 'relative' positioning mode
+            layer_thickness: Layer thickness in mm (used as unit scale)
         """
-        self.units = units
-        self.positioning = positioning
+        self.layer_thickness = layer_thickness
         
-        # G-code configuration
+        # CLI+ configuration
         self.config = {
-            'units_code': 'G21' if units == 'mm' else 'G20',
-            'positioning_code': 'G90' if positioning == 'absolute' else 'G91',
-            'feedrate_default': 1000,  # mm/min or in/min
-            'laser_power_max': 255,    # Maximum laser power
-            'precision': 3             # Decimal places for coordinates
+            'unit_scale': layer_thickness,  # Unit scale in mm
+            'power_default': 100,  # Default laser power in watts
+            'speed_default': 680,  # Default scan speed in mm/s
+            'precision': 3  # Decimal places for coordinates
         }
         
         # Trajectory metadata
@@ -3288,20 +3285,21 @@ class GCodeGenerator:
     # Path Processing Methods
     # ===============================
     
-    def generate_gcode(self, optimizer, optimized_params, filename="optimized_scan.gcode", 
-                      include_metadata=True, separate_trajectories=False):
+    def generate_cli(self, optimizer, optimized_params, filename="optimized_scan.cli", 
+                     include_metadata=True, separate_trajectories=False, num_layers=1):
         """
-        Generate G-code file from optimized laser parameters.
+        Generate CLI+ file from optimized laser parameters.
         
         Args:
             optimizer: TrajectoryOptimizer instance
             optimized_params: dictionary of optimized parameters
-            filename: output G-code filename
+            filename: output CLI filename
             include_metadata: whether to include parameter metadata in comments
             separate_trajectories: whether to output separate files for each trajectory
+            num_layers: number of layers to generate
             
         Returns:
-            str or list: filename(s) of generated G-code file(s)
+            str or list: filename(s) of generated CLI file(s)
         """
         # Extract laser parameters
         params_array = optimizer.parameters_to_array(optimized_params)
@@ -3312,11 +3310,11 @@ class GCodeGenerator:
         
         if separate_trajectories and len(trajectory_data) > 1:
             return self._generate_separate_files(
-                trajectory_data, filename, optimized_params, include_metadata
+                trajectory_data, filename, optimized_params, include_metadata, num_layers
             )
         else:
             return self._generate_combined_file(
-                trajectory_data, filename, optimized_params, include_metadata
+                trajectory_data, filename, optimized_params, include_metadata, num_layers
             )
     
     def _process_trajectories(self, optimizer, laser_params, heat_params):
@@ -3396,8 +3394,8 @@ class GCodeGenerator:
         # Resample path for consistent speed
         resampled_path = self._resample_path_constant_speed(path_points, v, dt)
         
-        # Calculate feedrate and laser power
-        feedrate = self._calculate_feedrate(v)
+        # Calculate speed and laser power
+        speed = self._calculate_speed(v)
         laser_power = self._calculate_laser_power(heat_params)
         
         # Store trajectory metadata
@@ -3414,7 +3412,7 @@ class GCodeGenerator:
             'id': laser_id,
             'type': trajectory_type,
             'path': resampled_path,
-            'feedrate': feedrate,
+            'speed': speed,
             'laser_power': laser_power,
             'params': params,
             'heat_params': heat_params
@@ -3454,24 +3452,20 @@ class GCodeGenerator:
         
         return np.column_stack([x_resampled, y_resampled])
     
-    def _calculate_feedrate(self, velocity_ms):
+    def _calculate_speed(self, velocity_ms):
         """
-        Convert velocity from m/s to appropriate feedrate units.
+        Convert velocity from m/s to mm/s for CLI format.
         
         Args:
             velocity_ms: velocity in m/s
             
         Returns:
-            float: feedrate in mm/min or in/min
+            float: speed in mm/s
         """
-        if self.units == 'mm':
-            # Convert m/s to mm/min
-            feedrate = velocity_ms * 1000 * 60
-        else:  # inches
-            # Convert m/s to in/min
-            feedrate = velocity_ms * 39.3701 * 60
+        # Convert m/s to mm/s
+        speed = velocity_ms * 1000
         
-        return round(feedrate, 1)
+        return round(speed, 1)
     
     def _calculate_laser_power(self, heat_params):
         """
@@ -3481,14 +3475,10 @@ class GCodeGenerator:
             heat_params: heat source parameters
             
         Returns:
-            int: laser power setting (0-255 range)
+            float: laser power in watts
         """
         power_watts = heat_params.get('Q', 200.0)
-        max_power = 500.0  # Set maximum power in watts
-        
-        # Scale to 0-255 range
-        power_setting = int((power_watts / max_power) * self.config['laser_power_max'])
-        return max(1, min(power_setting, self.config['laser_power_max']))
+        return round(power_watts, 1)
     
     def _calculate_path_length(self, path):
         """Calculate total path length in meters."""
@@ -3500,29 +3490,32 @@ class GCodeGenerator:
         return np.sum(segment_lengths)
     
     # ===============================
-    # G-code Generation Methods
+    # CLI+ Generation Methods
     # ===============================
     
-    def _generate_combined_file(self, trajectory_data, filename, optimized_params, include_metadata):
-        """Generate single G-code file with all trajectories."""
+    def _generate_combined_file(self, trajectory_data, filename, optimized_params, include_metadata, num_layers):
+        """Generate single CLI file with all trajectories."""
         with open(filename, 'w') as f:
             # Write header
-            self._write_gcode_header(f, optimized_params, include_metadata)
+            self._write_cli_header(f, num_layers, optimized_params, include_metadata)
             
-            # Write trajectories
-            for i, traj_data in enumerate(trajectory_data):
-                self._write_trajectory_gcode(f, traj_data, i + 1)
+            # Write geometry section
+            f.write("$$GEOMETRYSTART\n")
+            
+            # Write layers
+            for layer in range(num_layers):
+                self._write_layer(f, trajectory_data, layer, optimized_params)
             
             # Write footer
-            self._write_gcode_footer(f)
+            f.write("$$GEOMETRYEND\n")
         
-        print(f"G-code written to {filename}")
+        print(f"CLI file written to {filename}")
         self._print_generation_summary(trajectory_data, filename)
         
         return filename
     
-    def _generate_separate_files(self, trajectory_data, base_filename, optimized_params, include_metadata):
-        """Generate separate G-code files for each trajectory."""
+    def _generate_separate_files(self, trajectory_data, base_filename, optimized_params, include_metadata, num_layers):
+        """Generate separate CLI files for each trajectory."""
         generated_files = []
         base_name, ext = os.path.splitext(base_filename)
         
@@ -3531,45 +3524,42 @@ class GCodeGenerator:
             
             with open(filename, 'w') as f:
                 # Write header
-                self._write_gcode_header(f, optimized_params, include_metadata, traj_data['id'])
+                self._write_cli_header(f, num_layers, optimized_params, include_metadata, traj_data['id'])
                 
-                # Write single trajectory
-                self._write_trajectory_gcode(f, traj_data, traj_data['id'])
+                # Write geometry section
+                f.write("$$GEOMETRYSTART\n")
+                
+                # Write layers with single trajectory
+                for layer in range(num_layers):
+                    self._write_layer(f, [traj_data], layer, optimized_params)
                 
                 # Write footer
-                self._write_gcode_footer(f)
+                f.write("$$GEOMETRYEND\n")
             
             generated_files.append(filename)
-            print(f"G-code written to {filename}")
+            print(f"CLI file written to {filename}")
         
         self._print_generation_summary(trajectory_data, generated_files)
         return generated_files
     
-    def _write_gcode_header(self, file, optimized_params, include_metadata, laser_id=None):
-        """Write G-code file header with setup commands and metadata."""
-        file.write("; ===============================================\n")
-        if laser_id:
-            file.write(f"; Optimized Laser Trajectory G-code - Laser {laser_id}\n")
-        else:
-            file.write("; Optimized Laser Trajectory G-code\n")
-        file.write("; Generated by LPBF Trajectory Optimizer\n")
-        file.write(f"; Generated on: {self._get_timestamp()}\n")
-        file.write("; ===============================================\n\n")
+    def _write_cli_header(self, file, num_layers, optimized_params, include_metadata, laser_id=None):
+        """Write CLI+ file header."""
+        file.write("$$HEADERSTART\n")
+        file.write("$$ASCII\n")
+        file.write(f"$$UNITS/{self.config['unit_scale']:.5f}\n")
+        file.write(f"$$LAYERS/{num_layers}\n")
         
         # Include parameter metadata if requested
         if include_metadata:
             self._write_parameter_metadata(file, optimized_params, laser_id)
         
-        # Setup commands
-        file.write("; Setup commands\n")
-        file.write(f"{self.config['units_code']} ; Set units to {self.units}\n")
-        file.write(f"{self.config['positioning_code']} ; Set {'absolute' if self.positioning == 'absolute' else 'relative'} positioning\n")
-        file.write("G94 ; Set feedrate per minute mode\n")
-        file.write("M3 ; Spindle/Laser enable\n\n")
+        file.write("$$HEADEREND\n")
     
     def _write_parameter_metadata(self, file, optimized_params, laser_id=None):
-        """Write optimized parameters as G-code comments."""
-        file.write("; Optimized Parameters:\n")
+        """Write optimized parameters as CLI+ comments."""
+        file.write("$$DATE {0}\n".format(self._get_timestamp()))
+        file.write("$$COMMENT Optimized Laser Trajectory\n")
+        file.write("$$COMMENT Generated by LPBF Trajectory Optimizer\n")
         
         if laser_id:
             # Filter parameters for specific laser
@@ -3581,71 +3571,60 @@ class GCodeGenerator:
         
         for param, value in relevant_params.items():
             if isinstance(value, float):
-                file.write(f"; {param}: {value:.6f}\n")
+                file.write(f"$$COMMENT {param}: {value:.6f}\n")
             else:
-                file.write(f"; {param}: {value}\n")
-        
-        file.write(";\n")
+                file.write(f"$$COMMENT {param}: {value}\n")
         
         # Write trajectory information
         for laser_key, info in self.trajectory_info.items():
             if laser_id is None or laser_key == f'laser_{laser_id}':
-                file.write(f"; {laser_key.replace('_', ' ').title()} Information:\n")
-                file.write(f";   Type: {info['type'].capitalize()}\n")
-                file.write(f";   Velocity: {info['velocity']:.6f} m/s\n")
-                file.write(f";   Power: {info['power']:.1f} W\n")
-                file.write(f";   Spot Size: {info['spot_size']*1000:.3f} mm\n")
-                file.write(f";   Path Length: {info['path_length']*1000:.2f} mm\n")
-                file.write(f";   Points Count: {info['points_count']}\n")
-                file.write(";\n")
+                file.write(f"$$COMMENT {laser_key.replace('_', ' ').title()} Info\n")
+                file.write(f"$$COMMENT   Type: {info['type'].capitalize()}\n")
+                file.write(f"$$COMMENT   Velocity: {info['velocity']:.6f} m/s\n")
+                file.write(f"$$COMMENT   Power: {info['power']:.1f} W\n")
+                file.write(f"$$COMMENT   Spot Size: {info['spot_size']*1000:.3f} mm\n")
+                file.write(f"$$COMMENT   Path Length: {info['path_length']*1000:.2f} mm\n")
+                file.write(f"$$COMMENT   Points Count: {info['points_count']}\n")
     
-    def _write_trajectory_gcode(self, file, traj_data, trajectory_num):
-        """Write G-code commands for a single trajectory."""
+    def _write_layer(self, file, trajectory_data, layer_num, optimized_params):
+        """Write a single layer with all trajectories."""
+        file.write(f"$$LAYER/{layer_num}\n")
+        
+        # Write each trajectory for this layer
+        for traj_data in trajectory_data:
+            self._write_trajectory_hatches(file, traj_data)
+    
+    def _write_trajectory_hatches(self, file, traj_data):
+        """Write hatch lines for a single trajectory in CLI+ format."""
         trajectory_type = traj_data['type']
         path = traj_data['path']
-        feedrate = traj_data['feedrate']
+        speed = traj_data['speed']
         laser_power = traj_data['laser_power']
         
-        file.write(f"; {trajectory_type.capitalize()} trajectory - Laser {trajectory_num}\n")
-        file.write(f"F{feedrate:.1f} ; Set feedrate\n")
-        file.write(f"S{laser_power} ; Set laser power\n")
+        # Write power and speed parameters
+        file.write(f"$$POWER/{laser_power:.1f}\n")
+        file.write(f"$$SPEED/{speed:.1f}\n")
+        file.write(f"$$PARAM/sky_writing_mode, int, 1\n")
+        file.write(f"$$PARAM/laser_on_delay, double, 0.0\n")
+        file.write(f"$$PARAM/laser_off_delay, double, 0.0\n")
         
-        # Convert coordinates to appropriate units
-        unit_multiplier = 1000 if self.units == 'mm' else 39.3701
+        # Convert path to hatch lines (connect consecutive points)
+        unit_scale = self.config['unit_scale']
         precision = self.config['precision']
         
-        # Move to start position
-        x_start, y_start = path[0] * unit_multiplier
-        file.write(f"G0 X{x_start:.{precision}f} Y{y_start:.{precision}f} ; Rapid to start\n")
-        file.write("M3 ; Laser ON\n")
+        hatch_lines = []
+        for i in range(len(path) - 1):
+            x1, y1 = path[i] * 1000 / unit_scale  # Convert m to mm, then to units
+            x2, y2 = path[i + 1] * 1000 / unit_scale
+            
+            hatch_line = f"{x1:.{precision}f},{y1:.{precision}f},{x2:.{precision}f},{y2:.{precision}f}"
+            hatch_lines.append(hatch_line)
         
-        # Write path points
-        for i, (x, y) in enumerate(path[1:], 1):
-            x_coord = x * unit_multiplier
-            y_coord = y * unit_multiplier
-            
-            file.write(f"G1 X{x_coord:.{precision}f} Y{y_coord:.{precision}f}")
-            
-            # Add comments for key points
-            if i == 1:
-                file.write(" ; Start trajectory")
-            elif i == len(path) - 1:
-                file.write(" ; End trajectory")
-            elif i % 100 == 0:
-                file.write(f" ; Point {i}")
-            
-            file.write("\n")
-        
-        file.write("M5 ; Laser OFF\n")
-        file.write("G0 Z5 ; Lift Z (if applicable)\n\n")
+        # Write hatches command
+        if hatch_lines:
+            file.write(f"$$HATCHES/1,{len(hatch_lines)}," + ",".join(hatch_lines) + "\n")
     
-    def _write_gcode_footer(self, file):
-        """Write G-code file footer with cleanup commands."""
-        file.write("; Cleanup commands\n")
-        file.write("M5 ; Laser OFF\n")
-        file.write("G0 X0 Y0 ; Return to origin\n")
-        file.write("M30 ; Program end\n")
-        file.write("\n; End of G-code\n")
+
     
     # ===============================
     # Utility Methods
@@ -3657,9 +3636,9 @@ class GCodeGenerator:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     def _print_generation_summary(self, trajectory_data, filenames):
-        """Print summary of G-code generation."""
+        """Print summary of CLI+ generation."""
         print("\n" + "="*50)
-        print("G-code Generation Summary")
+        print("CLI+ Generation Summary")
         print("="*50)
         
         if isinstance(filenames, list):
@@ -3689,19 +3668,18 @@ class GCodeGenerator:
         
         print(f"\nTotal path length: {total_length*1000:.2f} mm")
         print(f"Total points: {total_points}")
-        print(f"Units: {self.units}")
-        print(f"Positioning: {self.positioning}")
+        print(f"Unit scale: {self.config['unit_scale']:.5f} mm")
     
     # ===============================
     # Validation Methods
     # ===============================
     
-    def validate_gcode(self, filename):
+    def validate_cli(self, filename):
         """
-        Perform basic validation of generated G-code file.
+        Perform basic validation of generated CLI file.
         
         Args:
-            filename: G-code file to validate
+            filename: CLI file to validate
             
         Returns:
             dict: validation results
@@ -3718,9 +3696,8 @@ class GCodeGenerator:
                 lines = f.readlines()
             
             # Basic validation checks
-            self._validate_gcode_structure(lines, validation_results)
-            self._validate_gcode_coordinates(lines, validation_results)
-            self._calculate_gcode_stats(lines, validation_results)
+            self._validate_cli_structure(lines, validation_results)
+            self._calculate_cli_stats(lines, validation_results)
             
         except Exception as e:
             validation_results['valid'] = False
@@ -3728,105 +3705,85 @@ class GCodeGenerator:
         
         return validation_results
     
-    def _validate_gcode_structure(self, lines, results):
-        """Validate basic G-code structure."""
-        has_start = any('M3' in line for line in lines)
-        has_end = any('M5' in line or 'M30' in line for line in lines)
+    def _validate_cli_structure(self, lines, results):
+        """Validate basic CLI+ structure."""
+        has_header_start = any('$$HEADERSTART' in line for line in lines)
+        has_header_end = any('$$HEADEREND' in line for line in lines)
+        has_geometry_start = any('$$GEOMETRYSTART' in line for line in lines)
+        has_geometry_end = any('$$GEOMETRYEND' in line for line in lines)
         
-        if not has_start:
-            results['warnings'].append("No laser/spindle start command (M3) found")
+        if not has_header_start:
+            results['errors'].append("Missing $$HEADERSTART")
         
-        if not has_end:
-            results['warnings'].append("No program end command (M5/M30) found")
-    
-    def _validate_gcode_coordinates(self, lines, results):
-        """Validate coordinate values are reasonable."""
-        coords = []
-        for line in lines:
-            if line.startswith('G0') or line.startswith('G1'):
-                # Extract X and Y coordinates
-                try:
-                    if 'X' in line and 'Y' in line:
-                        x_pos = line.find('X') + 1
-                        y_pos = line.find('Y') + 1
-                        
-                        x_end = min([i for i in [line.find(' ', x_pos), line.find(';', x_pos), len(line)] if i > x_pos])
-                        y_end = min([i for i in [line.find(' ', y_pos), line.find(';', y_pos), len(line)] if i > y_pos])
-                        
-                        x_val = float(line[x_pos:x_end])
-                        y_val = float(line[y_pos:y_end])
-                        coords.append((x_val, y_val))
-                except:
-                    continue
-        
-        if coords:
-            x_coords, y_coords = zip(*coords)
-            x_range = max(x_coords) - min(x_coords)
-            y_range = max(y_coords) - min(y_coords)
+        if not has_header_end:
+            results['errors'].append("Missing $$HEADEREND")
             
-            # Check for reasonable coordinate ranges
-            max_reasonable = 1000 if self.units == 'mm' else 40  # mm or inches
+        if not has_geometry_start:
+            results['errors'].append("Missing $$GEOMETRYSTART")
             
-            if x_range > max_reasonable or y_range > max_reasonable:
-                results['warnings'].append(f"Large coordinate range detected: X={x_range:.1f}, Y={y_range:.1f}")
+        if not has_geometry_end:
+            results['errors'].append("Missing $$GEOMETRYEND")
     
-    def _calculate_gcode_stats(self, lines, results):
-        """Calculate G-code file statistics."""
+    def _calculate_cli_stats(self, lines, results):
+        """Calculate CLI file statistics."""
         results['stats'] = {
             'total_lines': len(lines),
-            'comment_lines': len([l for l in lines if l.strip().startswith(';')]),
-            'move_commands': len([l for l in lines if l.strip().startswith(('G0', 'G1'))]),
-            'laser_commands': len([l for l in lines if 'M3' in l or 'M5' in l])
+            'comment_lines': len([l for l in lines if l.strip().startswith('$$COMMENT')]),
+            'layer_commands': len([l for l in lines if l.strip().startswith('$$LAYER')]),
+            'hatch_commands': len([l for l in lines if l.strip().startswith('$$HATCHES')])
         }
 
-def output_optimized_gcode(optimizer, optimized_params, filename="optimized_scan.gcode", 
-                          units='mm', separate_files=False, include_metadata=True, validate=True):
+def output_optimized_cli(optimizer, optimized_params, filename="optimized_scan.cli", 
+                         layer_thickness=0.03, separate_files=False, include_metadata=True, 
+                         validate=True, num_layers=1):
     """
-    Legacy function for backward compatibility with improved functionality.
+    Generate CLI+ file from optimized parameters.
     
     Args:
         optimizer: TrajectoryOptimizer instance
         optimized_params: dictionary of optimized parameters
-        filename: output G-code filename
-        units: 'mm' or 'inch' for coordinate units
+        filename: output CLI filename
+        layer_thickness: layer thickness in mm (unit scale)
         separate_files: whether to create separate files for each laser
         include_metadata: whether to include parameter metadata
-        validate: whether to validate generated G-code
+        validate: whether to validate generated CLI file
+        num_layers: number of layers to generate
     
     Returns:
-        str or list: filename(s) of generated G-code file(s)
+        str or list: filename(s) of generated CLI file(s)
     """
-    # Create G-code generator
-    generator = GCodeGenerator(units=units, positioning='absolute')
+    # Create CLI generator
+    generator = CLIGenerator(layer_thickness=layer_thickness)
     
-    # Generate G-code
-    generated_files = generator.generate_gcode(
+    # Generate CLI file
+    generated_files = generator.generate_cli(
         optimizer, 
         optimized_params, 
         filename,
         include_metadata=include_metadata,
-        separate_trajectories=separate_files
+        separate_trajectories=separate_files,
+        num_layers=num_layers
     )
     
     # Validate generated files if requested
     if validate:
         files_to_validate = generated_files if isinstance(generated_files, list) else [generated_files]
         
-        for gcode_file in files_to_validate:
-            validation_results = generator.validate_gcode(gcode_file)
+        for cli_file in files_to_validate:
+            validation_results = generator.validate_cli(cli_file)
             
             if validation_results['errors']:
-                print(f"\nValidation errors for {gcode_file}:")
+                print(f"\nValidation errors for {cli_file}:")
                 for error in validation_results['errors']:
                     print(f"  - {error}")
             
             if validation_results['warnings']:
-                print(f"\nValidation warnings for {gcode_file}:")
+                print(f"\nValidation warnings for {cli_file}:")
                 for warning in validation_results['warnings']:
                     print(f"  - {warning}")
             
             if validation_results['valid'] and not validation_results['errors']:
-                print(f"\n✓ {gcode_file} validated successfully")
+                print(f"\n✓ {cli_file} validated successfully")
     
     return generated_files
 
@@ -3839,22 +3796,25 @@ if __name__ == "__main__":
     # Run optimization
     model, optimizer, result, optimized_params = run_optimization()
     
-    # Enhanced G-code export with options
+    # Enhanced CLI+ export with options
     if model and optimizer and result and optimized_params and result.success:
         print("\n" + "="*50)
-        print("G-code Export Options")
+        print("CLI+ Export Options")
         print("="*50)
         
-        export_gcode = input("Would you like to export G-code? (y/n): ").strip().lower()
+        export_cli = input("Would you like to export CLI+? (y/n): ").strip().lower()
         
-        if export_gcode == 'y':
+        if export_cli == 'y':
             # Get export options
-            filename = input("Enter filename (default: optimized_scan.gcode): ").strip()
+            filename = input("Enter filename (default: optimized_scan.cli): ").strip()
             if not filename:
-                filename = "optimized_scan.gcode"
+                filename = "optimized_scan.cli"
             
-            units = input("Select units - (1) mm or (2) inches (default: mm): ").strip()
-            units = 'inch' if units == '2' else 'mm'
+            layer_thickness_str = input("Enter layer thickness in mm (default: 0.03): ").strip()
+            layer_thickness = float(layer_thickness_str) if layer_thickness_str else 0.03
+            
+            num_layers_str = input("Enter number of layers (default: 1): ").strip()
+            num_layers = int(num_layers_str) if num_layers_str else 1
             
             separate = input("Create separate files for each laser? (y/n, default: n): ").strip().lower()
             separate_files = separate == 'y'
@@ -3862,23 +3822,24 @@ if __name__ == "__main__":
             metadata = input("Include parameter metadata in comments? (y/n, default: y): ").strip().lower()
             include_metadata = metadata != 'n'
             
-            # Generate G-code
+            # Generate CLI+ file
             try:
-                generated_files = output_optimized_gcode(
+                generated_files = output_optimized_cli(
                     optimizer, 
                     optimized_params, 
                     filename,
-                    units=units,
+                    layer_thickness=layer_thickness,
                     separate_files=separate_files,
                     include_metadata=include_metadata,
-                    validate=True
+                    validate=True,
+                    num_layers=num_layers
                 )
                 
-                print(f"\n✓ G-code export completed successfully!")
+                print(f"\n✓ CLI+ export completed successfully!")
                 
             except Exception as e:
-                print(f"\n✗ G-code export failed: {str(e)}")
+                print(f"\n✗ CLI+ export failed: {str(e)}")
         else:
-            print("G-code export skipped.")
+            print("CLI+ export skipped.")
     else:
-        print("G-code export not available - optimization was not successful or incomplete.")
+        print("CLI+ export not available - optimization was not successful or incomplete.")
