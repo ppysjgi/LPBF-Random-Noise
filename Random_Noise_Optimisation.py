@@ -135,7 +135,6 @@ class HeatTransferModel:
         if v**2 > v_y**2:
             v_x = anp.sqrt(v**2 - v_y**2)
         else:
-            # Speed too low for this amplitude/period - reduce amplitude
             v_x = v * 0.5
             A = A * 0.5
             v_y = (2 * A * omega / anp.pi)
@@ -1449,7 +1448,7 @@ class TrajectoryOptimizer:
     
     def _calculate_parameter_sensitivity(self, name, index, base_params, base_obj, objective_func):
         """Calculate sensitivity for a single parameter."""
-        # Perturbation amount (5% of parameter value)
+        # Perturbation amount
         perturb_amount = max(base_params[index] * 0.05, 1e-6)
         
         # +5% perturbation
@@ -1556,7 +1555,7 @@ class Visualization:
             v = raster_speed  # Actual speed along the raster path
             noise_sigma = params.get('noise_sigma', 0.0)
         
-            # Limit noise to reasonable bounds
+            # Limit noise
             max_noise = 0.00005
             noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
         
@@ -1669,9 +1668,9 @@ class Visualization:
         x_start = 0.0015
         x_end = self.model.Lx - 0.0015
         y_start, y_end = 0.0002, 0.0008
-        hatch_spacing = 0.00008  # 80 um
+        hatch_spacing = 0.00008
         n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
-        raster_speed = 0.7  # 700 mm/s
+        raster_speed = 0.7
     
         raster_path, _ = self.generate_raster_scan(
             x_start, x_end, y_start, y_end, n_lines, raster_speed
@@ -1725,7 +1724,7 @@ class Visualization:
             # Get temporal statistics collected during simulation
             raster_temporal_stats = self.model.temporal_grad_stats
         
-            # DIAGNOSTIC: Print to verify values
+            # Print to verify values
             print(f"\nRaster Scan Statistics:")
             print(f"  Final max gradient: {np.max(grad_raster):.2e} °C/m")
             print(f"  Temporal max gradient: {raster_temporal_stats['max_over_time']:.2e} °C/m")
@@ -1808,7 +1807,6 @@ class Visualization:
                         laser_paths[traj_type].append((x * 1000, y * 1000))
 
         # Calculate gradient from final temperature field
-        # For optimized scan, use temperature at laser finish (not after full diffusion)
         T_opt_display = self.model.temporal_grad_stats.get('T_at_laser_finish', T_opt)
         _, _, grad_opt = self.model.compute_temperature_gradients(T_opt_display)
         opt_temporal_stats = self.model.temporal_grad_stats
@@ -1844,7 +1842,7 @@ class Visualization:
                     x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
                 elif laser['type'] == 'sawtooth':
                     x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
-                else:  # Swirl
+                else:
                     x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
         
                 # Only record position if laser hasn't reached end
@@ -1853,7 +1851,6 @@ class Visualization:
                     y_list.append(y * 1000)
                 
                     # Check if laser has reached end boundary
-                    # Use a small tolerance to detect when clamping starts
                     if x >= (x_end - 1e-6):
                         scan_complete = True
         
@@ -1905,7 +1902,7 @@ class Visualization:
                     x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
                 elif laser['type'] == 'sawtooth':
                     x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
-                else:  # Swirl
+                else:
                     x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
         
                 x_list.append(x * 1000)  # Convert to mm
@@ -2340,7 +2337,7 @@ class Visualization:
             'ax1': ax1,
             'ax2': ax2,
             'ax_inset_opt': ax_inset_opt,
-            'ax_inset_raster': None  # Will be created dynamically
+            'ax_inset_raster': None
         }
     
     def _initialize_animation_data(self, config):
@@ -2351,7 +2348,7 @@ class Visualization:
         # Extract laser positions and trajectories
         laser_positions = self._extract_animation_laser_positions(config)
     
-        # Initialize path history arrays to track actual noisy positions
+        # Initialize path history arrays to track noisy positions
         return {
             'T_raster': T_raster,
             'T_opt': T_opt,
@@ -2369,7 +2366,7 @@ class Visualization:
         dt = config['dt']
         t_points = np.linspace(0, nt * dt, nt)
 
-        # Raster positions using corrected mathematical approach
+        # Raster positions
         raster_trajectory = self._create_raster_trajectory_function(
             config['raster_config']['path'], 
             config['raster_config']['speed'],
@@ -2386,7 +2383,7 @@ class Visualization:
         return {
             'raster_trajectory': raster_trajectory,
             'raster_path': raster_path_points,
-            'optimized_positions': []  # Not needed since we calculate positions on-the-fly
+            'optimized_positions': []
         }
     
     def _create_animation_update_function(self, config, axes_config, animation_data):
@@ -2851,7 +2848,7 @@ class OptimizationRunner:
             initial_params, bounds = self._get_straight_parameters()
         elif trajectory_type == 'sawtooth':
             initial_params, bounds = self._get_sawtooth_parameters()
-        else:  # swirl
+        else:
             initial_params, bounds = self._get_swirl_parameters()
     
         # Add noise parameter
@@ -3487,7 +3484,7 @@ class GCodeGenerator:
             int: laser power setting (0-255 range)
         """
         power_watts = heat_params.get('Q', 200.0)
-        max_power = 500.0  # Assumed maximum power in watts
+        max_power = 500.0  # Set maximum power in watts
         
         # Scale to 0-255 range
         power_setting = int((power_watts / max_power) * self.config['laser_power_max'])
