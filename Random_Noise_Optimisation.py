@@ -1,5 +1,6 @@
 from logging import config
 from networkx import omega
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import autograd.numpy as anp 
@@ -21,44 +22,57 @@ class HeatTransferModel:
     """
     Heat transfer simulation model for LPBF processes.
     
-    Simulates 2D heat conduction with moving heat sources following
-    sawtooth or swirl trajectories with optional noise.
+    Simulates 2D heat conduction with moving heat sources.
+    Creates a base raster scan and compares to defined reference
+    trajectories with optional noise.
     """
     
-    def __init__(self, domain_size=(0.02, 0.0025), grid_size=(401, 51), dt=1e-4, material_params=None):
+    def __init__(self, domain_size=(0.02, 0.0025), grid_size=(401, 51), dt=1e-4, material_params=None, noise_seed=None):
         """
         Initialize the heat transfer model.
-        
+    
         Args:
             domain_size: (Lx, Ly) domain dimensions in meters
             grid_size: (nx, ny) grid resolution
             dt: time step in seconds
             material_params: dictionary of material properties
+            noise_seed: seed for noise RNG (Defaults random)
         """
         # Domain and grid setup
         self.Lx, self.Ly = domain_size
         self.nx, self.ny = grid_size
         self.dx = self.Lx / (self.nx - 1)
         self.dy = self.Ly / (self.ny - 1)
-        
+    
         # Create coordinate arrays
         self.x = anp.linspace(0, self.Lx, self.nx)
         self.y = anp.linspace(0, self.Ly, self.ny)
         self.X, self.Y = anp.meshgrid(self.x, self.y)
-        
+    
         # Time stepping
         self.dt = dt
         self.nt = None  # Set during simulation
-        
+    
         # Material properties with defaults
         self.material = self._set_material_properties(material_params)
-        
+    
         # Initialize temperature field
         self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
-        
+    
         # Derived properties
         self.heat_capacity = self.material['rho'] * self.material['cp']
         self.thickness = self.material['thickness']
+    
+        # Initialize reproducible noise generator
+        # Different each program run (if seed=None), but consistent within one run
+        if noise_seed is None:
+            import time
+            self._noise_seed = int(time.time() * 1000000) % 100000000
+        else:
+            self._noise_seed = noise_seed
+    
+        self._rng = np.random.RandomState(self._noise_seed)
+        print(f"Noise seed for this run: {self._noise_seed}")
 
     def _set_material_properties(self, material_params):
         """Set material properties with sensible defaults for steel."""
@@ -69,7 +83,7 @@ class HeatTransferModel:
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.02, # Plate thickness (m)
+            'thickness': 0.005,   # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0   # Absorptivity (fraction)
         }
         
@@ -77,10 +91,6 @@ class HeatTransferModel:
             default_params.update(material_params)
         
         return default_params
-
-    def reset(self):
-        """Reset temperature field to initial conditions."""
-        self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
 
     def _laplacian(self, T):
         """
@@ -105,7 +115,6 @@ class HeatTransferModel:
     def sawtooth_trajectory(self, t, params):
         """
         Calculate sawtooth laser position with continuous noise causing smooth path deviations.
-        Laser moves at speed v through the BASE trajectory, noise causes additional path length.
         """
         v = params['v']
         A = params['A']
@@ -120,66 +129,69 @@ class HeatTransferModel:
         x_start = 0.0015
         x_end = self.Lx - 0.0015
 
-        avg_dy_dt = (2 * A * omega / anp.pi) * anp.sqrt(0.5)
-        if v**2 > avg_dy_dt**2:
-            v_x = anp.sqrt(v**2 - avg_dy_dt**2)
+        v_y = (2 * A * omega / anp.pi)
+        
+        # Check if requested speed is achievable with this amplitude and period
+        if v**2 > v_y**2:
+            v_x = anp.sqrt(v**2 - v_y**2)
         else:
-            v_x = v * 0.8
+            # Speed too low for this amplitude/period - reduce amplitude
+            v_x = v * 0.5
             A = A * 0.5
+            v_y = (2 * A * omega / anp.pi)
     
         base_x = x_start + v_x * t
         base_y = y0 + A * (2/anp.pi) * anp.arcsin(anp.sin(omega * t))
     
-        # FIXED: Apply CONTINUOUS noise with LARGER amplitude but STRONGER mean reversion
+        # Apply noise with reproducible RNG
         if noise_sigma > 0:
+            # Initialize noise state if needed
             if not hasattr(self, '_noise_state'):
-                self._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
-        
+                self._noise_state = {
+                    'x': 0.0,
+                    'y': 0.0,
+                    'last_t': -1.0
+                }
+    
+            # Detect time discontinuities (reset or new trajectory)
             dt_noise = t - self._noise_state['last_t']
-        
-            # FIXED: Balance between amplitude and mean reversion
-            theta = 200.0  # INCREASED mean reversion rate to keep near base path
-            sigma_scale = 30.0  # Moderate diffusion scale for visible but controlled noise
-        
-            if dt_noise > 0 and dt_noise < 0.1:
-                # Stronger mean reversion to keep near base trajectory
-                drift_x = -theta * self._noise_state['x'] * dt_noise
-                drift_y = -theta * self._noise_state['y'] * dt_noise
-            
-                # Add noise kicks
-                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-            
-                self._noise_state['x'] += drift_x + diffusion_x
-                self._noise_state['y'] += drift_y + diffusion_y
-            
-                # Tighter clamping to prevent excessive wandering
-                max_deviation = noise_sigma * 5.0  # Reduced from 10.0
-                self._noise_state['x'] = anp.clip(self._noise_state['x'], -max_deviation, max_deviation)
-                self._noise_state['y'] = anp.clip(self._noise_state['y'], -max_deviation, max_deviation)
-            
-            elif dt_noise <= 0:
-                pass
-            else:
-                # Reset with moderate initial value
-                self._noise_state['x'] = noise_sigma * 2.0 * np.random.randn()
-                self._noise_state['y'] = noise_sigma * 2.0 * np.random.randn()
-        
+    
+            # Use seeded RNG for reproducible noise
+            if dt_noise > 2 * self.dt or dt_noise < 0:
+                # Reset detected - reinitialize with small random perturbation
+                self._noise_state['x'] = 0
+                self._noise_state['y'] = 0
+                self._noise_state['last_t'] = t - self.dt
+                dt_noise = self.dt
+    
+            # Ornstein-Uhlenbeck process parameters
+            theta = 200.0
+            sigma_scale = 30.0
+    
+            # Generate random increments using seeded RNG
+            diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+            diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+    
+            # Update noise state with mean reversion
+            drift_x = -theta * self._noise_state['x'] * dt_noise
+            drift_y = -theta * self._noise_state['y'] * dt_noise
+    
+            self._noise_state['x'] += drift_x + diffusion_x
+            self._noise_state['y'] += drift_y + diffusion_y
+    
+            # Apply noise to position
+            x = base_x + self._noise_state['x']
+            y = base_y + self._noise_state['y']
+    
+            # Update time
             self._noise_state['last_t'] = t
-        
-            noise_x = self._noise_state['x']
-            noise_y = self._noise_state['y']
-        
-            x = base_x + noise_x
-            y = base_y + noise_y
         else:
-            x = base_x
-            y = base_y
+            x, y = base_x, base_y
 
         k = 1000
         x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
-        x = max(x_start, x)
-        y = max(0, min(y, self.Ly))
+        x = anp.maximum(x_start, x)
+        y = anp.maximum(0, anp.minimum(y, self.Ly))
 
         tx_base = v_x
         ty_base = (2 * A * omega / anp.pi) * anp.cos(omega * t)
@@ -188,200 +200,355 @@ class HeatTransferModel:
         tx = tx_base / norm if norm > 0 else 1.0
         ty = ty_base / norm if norm > 0 else 0.0
 
-        return x, y, tx, ty
+        return float(x), float(y), float(tx), float(ty)
 
     def swirl_trajectory(self, t, params):
         """
         Calculate swirl laser position with continuous noise causing smooth path deviations.
-        Laser moves at speed v through the BASE trajectory, noise causes additional path length.
         """
-        v = params['v']  # Speed through the BASE swirl path
+        v = params['v']
         A = params['A']
         y0 = params['y0']
         fr = params['fr']
         noise_sigma = params.get('noise_sigma', 0.0)
 
-        # Limit noise to reasonable bounds
         max_noise = 0.00005
         noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
 
         om = 2 * anp.pi * fr
         x_start = 0.0015
         x_end = self.Lx - 0.0015
-
-        # Calculate base velocity
+        
         A_om = A * om
-        if v**2 > (A_om**2) / 2:
-            v_base = anp.sqrt(v**2 - (A_om**2) / 2)
+        if v**2 > A_om**2:
+            v_base = anp.sqrt(v**2 - A_om**2)
         else:
             v_base = v * 0.7
             A = A * 0.5
             A_om = A * om
     
         # Calculate base trajectory position
-        base_x = x_start + v_base * t + A * anp.sin(om * t)
-        base_y = y0 + A * anp.cos(om * t)
+        base_x = x_start + v_base * t + A * anp.cos(om * t)
+        base_y = y0 + A * anp.sin(om * t)
     
-        # FIXED: Apply CONTINUOUS noise with MUCH LARGER amplitude
+        # Apply noise with reproducible RNG
         if noise_sigma > 0:
-            # Initialize noise state if not exists
+            # Initialize noise state if needed
             if not hasattr(self, '_noise_state_swirl'):
-                self._noise_state_swirl = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
-        
-            # Time step since last update
+                self._noise_state_swirl = {
+                    'x': 0.0,
+                    'y': 0.0,
+                    'last_t': -1.0
+                }
+    
+            # Detect time discontinuities
             dt_noise = t - self._noise_state_swirl['last_t']
-        
-            # FIXED: Much more aggressive parameters
-            theta = 200.0  # VERY REDUCED mean reversion rate
-            sigma_scale = 30.0  # MUCH LARGER diffusion scale
-        
-            if dt_noise > 0 and dt_noise < 0.1:
-                # Update noise state with Ornstein-Uhlenbeck process
-                drift_x = -theta * self._noise_state_swirl['x'] * dt_noise
-                drift_y = -theta * self._noise_state_swirl['y'] * dt_noise
-            
-                # MUCH LARGER diffusion for visible amplitude
-                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-            
-                self._noise_state_swirl['x'] += drift_x + diffusion_x
-                self._noise_state_swirl['y'] += drift_y + diffusion_y
-            
-                # Allow much larger deviations
-                max_deviation = noise_sigma * 5.0
-                self._noise_state_swirl['x'] = anp.clip(self._noise_state_swirl['x'], -max_deviation, max_deviation)
-                self._noise_state_swirl['y'] = anp.clip(self._noise_state_swirl['y'], -max_deviation, max_deviation)
-            
-            elif dt_noise <= 0:
-                pass
-            else:
-                # Large time jump - reset with much larger initial value
-                self._noise_state_swirl['x'] = noise_sigma * 5.0 * np.random.randn()
-                self._noise_state_swirl['y'] = noise_sigma * 5.0 * np.random.randn()
-        
+    
+            # Use seeded RNG for reproducible noise
+            if dt_noise > 2 * self.dt or dt_noise < 0:
+                self._noise_state_swirl['x'] = 0
+                self._noise_state_swirl['y'] = 0
+                self._noise_state_swirl['last_t'] = t - self.dt
+                dt_noise = self.dt
+    
+            # Ornstein-Uhlenbeck process
+            theta = 200.0
+            sigma_scale = 30.0
+    
+            # Generate random increments using seeded RNG
+            diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+            diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+    
+            # Update with mean reversion
+            drift_x = -theta * self._noise_state_swirl['x'] * dt_noise
+            drift_y = -theta * self._noise_state_swirl['y'] * dt_noise
+    
+            self._noise_state_swirl['x'] += drift_x + diffusion_x
+            self._noise_state_swirl['y'] += drift_y + diffusion_y
+    
+            x = base_x + self._noise_state_swirl['x']
+            y = base_y + self._noise_state_swirl['y']
+    
             self._noise_state_swirl['last_t'] = t
-        
-            noise_x = self._noise_state_swirl['x']
-            noise_y = self._noise_state_swirl['y']
-        
-            x = base_x + noise_x
-            y = base_y + noise_y
         else:
-            x = base_x
-            y = base_y
+            x, y = base_x, base_y
 
         # Apply boundary constraints
         k = 1000
         x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
-        x = max(x_start, x)
-        y = max(0, min(y, self.Ly))
+        x = anp.maximum(x_start, x)
+        y = anp.maximum(0, anp.minimum(y, self.Ly))
 
         # Direction vector from base trajectory
-        tx_base = v_base + A * om * anp.cos(om * t)
-        ty_base = -A * om * anp.sin(om * t)
+        # dx/dt = v_base - A*om*sin(om*t), dy/dt = A*om*cos(om*t)
+        tx_base = v_base - A * om * anp.sin(om * t)
+        ty_base = A * om * anp.cos(om * t)
     
         # Normalize to unit vector
         norm = anp.sqrt(tx_base**2 + ty_base**2)
         tx = tx_base / norm if norm > 0 else 1.0
         ty = ty_base / norm if norm > 0 else 0.0
 
-        return x, y, tx, ty
+        return float(x), float(y), float(tx), float(ty)
 
     def straight_trajectory(self, t, params):
         """
-        Calculate straight laser position with continuous noise causing smooth path deviations.
-        Laser moves at speed v horizontally, noise causes wandering but smooth path.
+        Calculate straight laser position with noise causing smooth path deviations.
         """
-        v = params['v']  # Speed through the BASE straight path
+        v = params['v']
         y0 = params['y0']
         noise_sigma = params.get('noise_sigma', 0.0)
 
-        # Limit noise to reasonable bounds
         max_noise = 0.00005
         noise_sigma = anp.clip(noise_sigma, 0.0, max_noise)
 
         x_start = 0.0015
         x_end = self.Lx - 0.0015
 
-        # Base velocity is simply v in x-direction
+        # Base velocity
         base_x = x_start + v * t
         base_y = y0
     
-        # FIXED: Apply CONTINUOUS noise with MUCH LARGER amplitude
+        # Apply noise with reproducible RNG
         if noise_sigma > 0:
-            # Initialize noise state if not exists
+            # Initialize noise state if needed
             if not hasattr(self, '_noise_state_straight'):
-                self._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
-        
-            # Time step since last update
+                self._noise_state_straight = {
+                    'x': 0.0,
+                    'y': 0.0,
+                    'last_t': -1.0
+                }
+    
+            # Detect time discontinuities
             dt_noise = t - self._noise_state_straight['last_t']
-        
-            # FIXED: Much more aggressive parameters
-            theta = 200.0  # VERY REDUCED mean reversion rate
-            sigma_scale = 30.0  # MUCH LARGER diffusion scale
-        
-            if dt_noise > 0 and dt_noise < 0.1:
-                # Update noise state with Ornstein-Uhlenbeck process
-                drift_x = -theta * self._noise_state_straight['x'] * dt_noise
-                drift_y = -theta * self._noise_state_straight['y'] * dt_noise
-            
-                # MUCH LARGER diffusion for visible amplitude
-                diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-                diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * np.random.randn()
-            
-                self._noise_state_straight['x'] += drift_x + diffusion_x
-                self._noise_state_straight['y'] += drift_y + diffusion_y
-            
-                # Allow much larger deviations
-                max_deviation = noise_sigma * 5.0
-                self._noise_state_straight['x'] = anp.clip(self._noise_state_straight['x'], -max_deviation, max_deviation)
-                self._noise_state_straight['y'] = anp.clip(self._noise_state_straight['y'], -max_deviation, max_deviation)
-            
-            elif dt_noise <= 0:
-                pass
-            else:
-                # Large time jump - reset with much larger initial value
-                self._noise_state_straight['x'] = noise_sigma * 5.0 * np.random.randn()
-                self._noise_state_straight['y'] = noise_sigma * 5.0 * np.random.randn()
-        
+    
+            # Use seeded RNG for reproducible noise
+            if dt_noise > 2 * self.dt or dt_noise < 0:
+                self._noise_state_straight['x'] = 0
+                self._noise_state_straight['y'] = 0
+                self._noise_state_straight['last_t'] = t - self.dt
+                dt_noise = self.dt
+    
+            # Ornstein-Uhlenbeck process
+            theta = 200.0
+            sigma_scale = 30.0
+    
+            # Generate random increments using seeded RNG
+            diffusion_x = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+            diffusion_y = noise_sigma * sigma_scale * anp.sqrt(dt_noise) * self._rng.randn()
+    
+            # Update with mean reversion
+            drift_x = -theta * self._noise_state_straight['x'] * dt_noise
+            drift_y = -theta * self._noise_state_straight['y'] * dt_noise
+    
+            self._noise_state_straight['x'] += drift_x + diffusion_x
+            self._noise_state_straight['y'] += drift_y + diffusion_y
+    
+            x = base_x + self._noise_state_straight['x']
+            y = base_y + self._noise_state_straight['y']
+    
             self._noise_state_straight['last_t'] = t
-        
-            noise_x = self._noise_state_straight['x']
-            noise_y = self._noise_state_straight['y']
-        
-            x = base_x + noise_x
-            y = base_y + noise_y
         else:
-            x = base_x
-            y = base_y
+            x, y = base_x, base_y
 
         # Apply boundary constraints
         k = 1000
         x = x - (x - x_end) * (1 / (1 + anp.exp(-k * (x - x_end))))
-        x = max(x_start, x)
-        y = max(0, min(y, self.Ly))
-
+        x = anp.maximum(x_start, x)
+        y = anp.maximum(0, anp.minimum(y, self.Ly))
         # Direction vector is simply horizontal
         tx, ty = 1.0, 0.0
 
-        return x, y, tx, ty
+        return float(x), float(y), float(tx), float(ty)
     
     def reset(self):
         """Reset temperature field to initial conditions and clear noise states."""
         self.T = self.material['T0'] * anp.ones((self.ny, self.nx))
-    
-        # FIXED: Properly reset ALL noise states for all trajectory types
-        # Clear noise state for sawtooth
+
+        # Delete noise states for all trajectory types
         if hasattr(self, '_noise_state'):
-            self._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
-    
-        # Clear noise state for swirl  
+            del self._noise_state
+
         if hasattr(self, '_noise_state_swirl'):
-            self._noise_state_swirl = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
-    
-    #    Clear noise state for straight
+            del self._noise_state_swirl
+
         if hasattr(self, '_noise_state_straight'):
-            self._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
+            del self._noise_state_straight
+
+   
+
+    def precalculate_trajectory(self, laser_config, nt, dt):
+        """
+        Pre-calculate entire trajectory with noise evolution.
+    
+        Args:
+            laser_config: laser configuration dictionary
+            nt: number of time steps
+            dt: time step size
+        
+        Returns:
+            list of (x, y, tx, ty) tuples for each time step
+        """
+    
+        # Extract trajectory type from laser configuration
+        trajectory_type = laser_config['type']
+        
+        # Reset noise state for this trajectory type before precalculation
+        if trajectory_type == 'sawtooth':
+            if hasattr(self, '_noise_state'):
+                del self._noise_state
+        elif trajectory_type == 'swirl':
+            if hasattr(self, '_noise_state_swirl'):
+                del self._noise_state_swirl
+        elif trajectory_type == 'straight':
+            if hasattr(self, '_noise_state_straight'):
+                del self._noise_state_straight
+        
+        # Calculate the raw trajectory points with noise
+        raw_trajectory_points = []
+        for n in range(nt):
+            t = n * dt
+            if trajectory_type == 'sawtooth':
+                x, y, tx, ty = self.sawtooth_trajectory(t, laser_config['params'])
+            elif trajectory_type == 'swirl':
+                x, y, tx, ty = self.swirl_trajectory(t, laser_config['params'])
+            elif trajectory_type == 'straight':
+                x, y, tx, ty = self.straight_trajectory(t, laser_config['params'])
+            else:
+                raise ValueError(f"Unknown trajectory type: {trajectory_type}")
+        
+            raw_trajectory_points.append((x, y, tx, ty))
+        
+        # Check if noise is being used
+        noise_sigma = laser_config['params'].get('noise_sigma', 0.0)
+        
+        # If noise is present, interpolate to maintain constant distance per time step
+        if noise_sigma > 0:
+            trajectory_points = self._interpolate_trajectory_arc_length(raw_trajectory_points, dt, laser_config['params'])
+        else:
+            trajectory_points = raw_trajectory_points
+    
+        return trajectory_points
+    
+    def _interpolate_trajectory_arc_length(self, raw_points, dt, params):
+        """
+        Interpolate trajectory points to maintain approximately constant arc length per time step.
+        
+        When noise is applied, the laser jumps varying distances between time steps.
+        This function adds intermediate points so the laser travels the same distance 
+        at each time step, moving smoothly between the noisy coordinates.
+        
+        Args:
+            raw_points: list of (x, y, tx, ty) tuples from noisy trajectory
+            dt: original time step
+            params: trajectory parameters containing speed 'v'
+            
+        Returns:
+            list of interpolated (x, y, tx, ty) tuples with consistent spacing
+        """
+        if len(raw_points) < 2:
+            return raw_points
+        
+        # Get target speed from parameters
+        v = params.get('v', 0.7)  # Default speed if not specified
+        target_distance = v * dt  # Target distance per time step
+        
+        # Build the path as a list of segments with cumulative distances
+        cumulative_distances = [0.0]
+        total_distance = 0.0
+        
+        for i in range(len(raw_points) - 1):
+            x1, y1, _, _ = raw_points[i]
+            x2, y2, _, _ = raw_points[i + 1]
+            segment_distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            total_distance += segment_distance
+            cumulative_distances.append(total_distance)
+        
+        # Determine points needed
+        num_steps = int(np.ceil(total_distance / target_distance))
+        if num_steps == 0:
+            return raw_points
+        
+        # Create evenly spaced distance samples
+        interpolated_points = []
+        interpolated_points.append(raw_points[0])
+        
+        for step in range(1, num_steps):
+            target_dist = step * target_distance
+            
+            # Find segment distance falls in
+            segment_idx = 0
+            for i in range(len(cumulative_distances) - 1):
+                if cumulative_distances[i] <= target_dist < cumulative_distances[i + 1]:
+                    segment_idx = i
+                    break
+            
+            # Handle edge case where target_dist equals total_distance
+            if target_dist >= cumulative_distances[-1]:
+                segment_idx = len(raw_points) - 2
+            
+            # Interpolate within this segment
+            x1, y1, _, _ = raw_points[segment_idx]
+            x2, y2, _, _ = raw_points[segment_idx + 1]
+            
+            # Calculate the fraction along this specific segment
+            segment_start_dist = cumulative_distances[segment_idx]
+            segment_end_dist = cumulative_distances[segment_idx + 1]
+            segment_length = segment_end_dist - segment_start_dist
+            
+            if segment_length > 0:
+                local_fraction = (target_dist - segment_start_dist) / segment_length
+                local_fraction = np.clip(local_fraction, 0.0, 1.0)
+                
+                # Interpolate position
+                x_new = x1 + local_fraction * (x2 - x1)
+                y_new = y1 + local_fraction * (y2 - y1)
+                
+                # Calculate tangent direction from segment
+                segment_dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                if segment_dist > 0:
+                    tx = (x2 - x1) / segment_dist
+                    ty = (y2 - y1) / segment_dist
+                else:
+                    tx, ty = 1.0, 0.0
+                
+                interpolated_points.append((x_new, y_new, tx, ty))
+        
+        # End point
+        interpolated_points.append(raw_points[-1])
+        
+        return interpolated_points
+
+    def get_trajectory_point_from_cache(self, t, laser_config, cached_trajectory=None):
+        """
+        Get trajectory point from pre-calculated cache or calculate on-the-fly.
+    
+        Args:
+            t: time
+            laser_config: laser configuration
+            cached_trajectory: pre-calculated trajectory points (optional)
+        
+        Returns:
+            (x, y, tx, ty) tuple
+        """
+        if cached_trajectory is not None:
+            # Use cached trajectory
+            dt = self.dt if hasattr(self, 'dt') else 1e-5
+            frame = int(t / dt)
+            nt = len(cached_trajectory)
+            frame = min(frame, nt - 1)  # Clamp to valid range
+            return cached_trajectory[frame]
+        else:
+            # Calculate on-the-fly
+            trajectory_type = laser_config['type']
+            if trajectory_type == 'sawtooth':
+                return self.sawtooth_trajectory(t, laser_config['params'])
+            elif trajectory_type == 'swirl':
+                return self.swirl_trajectory(t, laser_config['params'])
+            elif trajectory_type == 'straight':
+                return self.straight_trajectory(t, laser_config['params'])
+            else:
+                raise ValueError(f"Unknown trajectory type: {trajectory_type}")
 
     def _gaussian_source(self, x_src, y_src, heat_params):
         """
@@ -403,7 +570,7 @@ class HeatTransferModel:
             sigma_x = heat_params.get('sigma_x', 1.5e-3)
             sigma_y = heat_params.get('sigma_y', 1.5e-3)
         
-        # Apply absorptivity if available
+        # Apply absorptivity
         absorbed_power = power * self.material.get('absorptivity', 1.0)
         
         # Calculate Gaussian distribution
@@ -413,7 +580,7 @@ class HeatTransferModel:
         return G * absorbed_power
 
     def _apply_boundary_conditions(self, T):
-        """Apply convective boundary conditions instead of fixed temperature."""
+        """Apply convective boundary conditions."""
         # Convective heat transfer coefficient (W/m²·K)
         h = 10.0  # Typical value for air convection
         T_amb = self.material['T0']  # Ambient temperature
@@ -421,7 +588,7 @@ class HeatTransferModel:
         # Calculate convective cooling rate
         dt_factor = self.dt * h / (self.material['rho'] * self.material['cp'] * self.thickness)
     
-        # Apply convective cooling (heat loss proportional to temperature difference)
+        # Apply convective cooling
         # Top boundary
         T[0, :] = T[0, :] - dt_factor * np.maximum(0, T[0, :] - T_amb)
         # Bottom boundary
@@ -436,112 +603,160 @@ class HeatTransferModel:
     
         return T
 
-    def simulate(self, parameters, start_x=0.0, end_x=None, use_gaussian=True, verbose=False):
+    def simulate(self, parameters, start_x=0.0, end_x=None, use_gaussian=True, verbose=False, nt=None):
         """
         Run heat transfer simulation with moving laser sources.
-    
-        Args:
-            parameters: tuple of (laser_params, heat_params)
-            start_x, end_x: x-range for simulation (meters)
-            use_gaussian: whether to use Gaussian heat source
-            verbose: print simulation progress
         
-        Returns:
-            Final temperature field
+        Args:
+            nt: Number of time steps (default: 6000)
         """
         laser_params, heat_params = parameters
-    
+
         # Reset to initial conditions
         self.reset()
-    
+
         # Set simulation domain
         if end_x is None:
             end_x = self.Lx
-    
-        # Fixed number of time steps for consistency
-        self.nt = 6000
-    
+
+        # Fixed number of time steps for consistency (before interpolation)
+        self.nt = nt if nt is not None else 4000
+
         # Get thermal diffusivity
         if 'alpha' not in self.material and 'k' in self.material:
             alpha = self.material['k'] / (self.material['rho'] * self.material['cp'])
         else:
             alpha = self.material['alpha']
+
+        # Pre-calculate trajectories with continuous noise evolution
+        # NOTE: After interpolation, the actual number of points may differ from self.nt
+        if isinstance(laser_params, tuple):
+            cached_trajectories = []
+            for laser_config in laser_params:
+                traj_cache = self.precalculate_trajectory(laser_config, self.nt, self.dt)
+                cached_trajectories.append(traj_cache)
+        else:
+            cached_trajectories = self.precalculate_trajectory(laser_params, self.nt, self.dt)
+    
+        # Store cached trajectories for animation/visualization use
+        self._cached_trajectories = cached_trajectories
+        
+        # Determine actual number of time steps from the trajectories
+        if isinstance(cached_trajectories, list) and len(cached_trajectories) > 0:
+            if isinstance(cached_trajectories[0], list):
+                # Multiple lasers - use the maximum length
+                actual_nt = max(len(traj) for traj in cached_trajectories)
+            else:
+                # Single laser
+                actual_nt = len(cached_trajectories)
+        else:
+            actual_nt = self.nt
     
         # Initialize gradient tracking arrays
         max_gradients = []
         mean_gradients = []
-    
+
         # Main simulation loop
         T = self.T.copy()
     
-        # In the simulate method, add position tracking in the loop:
-        for n in range(self.nt):
-            t = n * self.dt
-            S_total = 0
+        # Boundary limits
+        x_start_limit = 0.0015
+        x_end_limit = self.Lx - 0.0015
     
-            # Handle single or dual laser sources
-            if isinstance(laser_params, tuple):
-                # Multiple laser sources
-                for i, laser in enumerate(laser_params):
-                    x, y, _, _ = self._get_laser_position(t, laser)
-            
-                    # Track positions if requested
-                    if hasattr(self, '_track_laser_positions') and self._track_laser_positions:
-                        laser_type = laser['type']
-                        # Only track if within scan bounds
-                        x_start, x_end = 0.0015, self.Lx - 0.0015
-                        if x < (x_end - 1e-6):
-                            if not self._laser_position_history[laser_type]:
-                                self._laser_position_history[laser_type].append(([], []))
-                            self._laser_position_history[laser_type][i][0].append(x * 1000)
-                            self._laser_position_history[laser_type][i][1].append(y * 1000)
-            
-                    S = self._gaussian_source(x, y, heat_params[i])
-                    S_total += S
-            else:
-                # Single laser source
-                x, y, _, _ = self._get_laser_position(t, laser_params)
-        
-                # Track positions if requested
-                if hasattr(self, '_track_laser_positions') and self._track_laser_positions:
-                    laser_type = laser_params['type']
-                    x_start, x_end = 0.0015, self.Lx - 0.0015
-                    if x < (x_end - 1e-6):
-                        if not self._laser_position_history[laser_type]:
-                            self._laser_position_history[laser_type].append(([], []))
-                        self._laser_position_history[laser_type][0][0].append(x * 1000)
-                        self._laser_position_history[laser_type][0][1].append(y * 1000)
-        
-                S_total = self._gaussian_source(x, y, heat_params)
-        
-            # Solve heat equation: ∂T/∂t = α∇²T + S/(ρcp)
-            lap = self._laplacian(T)
-            T_diff = T + self.dt * alpha * lap
+        # Track when lasers have finished
+        all_lasers_finished = False
+        final_timestep = actual_nt
 
-            # Add heat source term
+        for n in range(actual_nt):
+            t = n * self.dt
+        
+            # Calculate heat source from laser(s) using cached trajectories
+            S_total = anp.zeros_like(T)
+            any_laser_active = False  # Track if any laser is still active
+        
+            if isinstance(laser_params, tuple):
+                # Multiple lasers
+                for i, laser_config in enumerate(laser_params):
+                    # Get position from cache (handle varying trajectory lengths)
+                    if n < len(cached_trajectories[i]):
+                        x, y, _, _ = cached_trajectories[i][n]
+                    else:
+                        # Use last position if out of trajectory points
+                        x, y, _, _ = cached_trajectories[i][-1]
+            
+                    # Check if laser is within valid range
+                    laser_active = x_start_limit <= x <= x_end_limit
+                
+                    if laser_active:
+                        any_laser_active = True
+                
+                    # Get heat parameters
+                    heat_p = heat_params[i] if isinstance(heat_params, (list, tuple)) else heat_params
+
+                    if use_gaussian and laser_active:
+                        S = self._gaussian_source(x, y, heat_p)
+                        S_total += S
+            else:
+                # Single laser - get position from cache
+                if n < len(cached_trajectories):
+                    x, y, _, _ = cached_trajectories[n]
+                else:
+                    # Use last position if run out of trajectory points
+                    x, y, _, _ = cached_trajectories[-1]
+        
+                # Check if laser is within valid range
+                laser_active = x_start_limit <= x <= x_end_limit
+            
+                if laser_active:
+                    any_laser_active = True
+        
+                if use_gaussian and laser_active:
+                    S_total = self._gaussian_source(x, y, heat_params)
+        
+            # Check if all lasers have finished and store temperature at that moment
+            if not any_laser_active and not all_lasers_finished:
+                all_lasers_finished = True
+                final_timestep = n
+                T_at_laser_finish = T.copy()  # Store temperature when laser turns off
+        
+            # Heat equation: dT/dt = alpha * laplacian(T) + S/(rho*cp*thickness)
+            lap = self._laplacian(T)
+            dT_diffusion = alpha * lap
+        
+            # Source term
             volume_factor = self.dx * self.dy * self.thickness
-            source_increment = (self.dt * S_total) / (volume_factor * self.heat_capacity)
-            T_new = T_diff + source_increment
+            dT_source = S_total / (volume_factor * self.heat_capacity)
+        
+            # Update temperature
+            T = T + self.dt * (dT_diffusion + dT_source)
         
             # Apply boundary conditions
-            T = self._apply_boundary_conditions(T_new)
+            T = self._apply_boundary_conditions(T)
         
-            # Compute and store gradients at each time step
+            # Track gradients for analysis
             _, _, grad_mag = self.compute_temperature_gradients(T)
-            max_gradients.append(np.max(grad_mag))
-            mean_gradients.append(np.mean(grad_mag))
-    
+            max_gradients.append(anp.max(grad_mag))
+            mean_gradients.append(anp.mean(grad_mag))
+        
+            # OPTIONAL: Stop simulation early once optimsed scan finishes, doesn't guarentee multiple raster vectors
+            # Uncomment the following lines to stop immediately after lasers finish
+            # if all_lasers_finished:
+            #     print(f"Stopping simulation early at timestep {n}")
+            #     break
+
         # Store temporal gradient statistics
         self.temporal_grad_stats = {
             'max_over_time': np.max(max_gradients),
             'mean_over_time': np.mean(mean_gradients),
             'max_gradients': max_gradients,
-            'mean_gradients': mean_gradients
+            'mean_gradients': mean_gradients,
+            'final_timestep': final_timestep,  # Store when lasers actually finished
+            'T_at_laser_finish': T_at_laser_finish if all_lasers_finished else T  # Temperature when laser turned off
         }
-    
+
         self.T = T
         return self.T
-
+    
     def _get_laser_position(self, t, laser_params):
         """Get laser position based on trajectory type."""
         if laser_params['type'] == 'sawtooth':
@@ -589,7 +804,7 @@ class HeatTransferModel:
     
 class TrajectoryOptimizer:
     """
-    Optimization class for laser trajectory parameters in LPBF processes.
+    Optimization class for laser trajectory parameters in L-PBF processes.
     
     Supports both single and dual laser configurations with various
     objective functions and constraint handling.
@@ -610,16 +825,16 @@ class TrajectoryOptimizer:
         self.bounds = bounds or {}
         self.x_range = x_range
         
-        # Extract parameter names for optimization (exclude fixed y0 parameters)
+        # Extract parameter names for optimization
         self.param_names = self._get_optimization_parameters()
         
     def _get_optimization_parameters(self):
-        """Extract parameters to be optimized, excluding fixed y0 and r0 values."""
+        """Extract parameters to be optimized."""
         fixed_keys = {
             'sawtooth_y0', 'swirl_y0', 'straight_y0',
             'sawtooth2_y0', 'swirl2_y0', 'straight2_y0',
-            'sawtooth_r0', 'swirl_r0', 'straight_r0',  # ADDED: exclude r0 parameters
-            'sawtooth2_r0', 'swirl2_r0', 'straight2_r0'  # ADDED: exclude r0 for dual lasers
+            'sawtooth_r0', 'swirl_r0', 'straight_r0',
+            'sawtooth2_r0', 'swirl2_r0', 'straight2_r0'
         }
 
         param_names = [k for k in self.initial_params.keys() if k not in fixed_keys]
@@ -768,7 +983,7 @@ class TrajectoryOptimizer:
     # ===============================
     # Objective Functions
     # ===============================
-    
+
     def _validate_parameters(self, params_array):
         """Check for extreme parameter values that would cause numerical issues."""
         for i, name in enumerate(self.param_names):
@@ -973,9 +1188,6 @@ class TrajectoryOptimizer:
         # Add parameter bound constraints
         constraints.extend(self._create_bound_constraints())
         
-        # Add trajectory-specific constraints (optional)
-        # constraints.extend(self._create_trajectory_constraints())
-        
         return constraints
     
     def _create_bound_constraints(self):
@@ -1000,13 +1212,8 @@ class TrajectoryOptimizer:
         return constraints
     
     def _create_trajectory_constraints(self):
-        """Create trajectory-specific constraints (currently disabled)."""
+        """Create trajectory-specific constraints here if unique additions wanted."""
         constraints = []
-        
-        # Example constraints that can be enabled if needed:
-        # - Minimum distance between lasers
-        # - Trajectory bounds within domain
-        # - Energy density limits
         
         return constraints
     
@@ -1054,7 +1261,7 @@ class TrajectoryOptimizer:
             # Minimum y constraint
             constraints.append(-(y0 - A))
         
-        # Similar constraints for second laser if present
+        # Similar for second laser if present
         if 'sawtooth2_A' in params_dict:
             y0 = self.initial_params.get('sawtooth2_y0', 0.00125)
             A = params_dict['sawtooth2_A']
@@ -1148,7 +1355,7 @@ class TrajectoryOptimizer:
         objective_func = objective_functions[objective_type]
         initial_params_array = self.parameters_to_array(self.initial_params)
         
-        # Set up constraints for constrained methods
+        # Set up constraints
         constraints = None
         if method.upper() in ['SLSQP', 'COBYLA']:
             constraints = [{
@@ -1363,16 +1570,16 @@ class Visualization:
             horizontal_distance = x_end - x_start
             vertical_distance = hatch_spacing
         
-            # Each "pass" consists of horizontal scan + vertical move
+            # Each pass consists of horizontal scan + vertical move
             pass_distance = horizontal_distance + vertical_distance
         
-            # Which pass are we in?
+            # Current pass
             pass_num = int(target_distance / pass_distance)
             distance_in_pass = target_distance - pass_num * pass_distance
         
             y_current = y_start + pass_num * hatch_spacing
 
-            # Check if we've reached the end
+            # Check if end reached
             max_passes = int((y_end - y_start) / hatch_spacing) + 2
         
             if pass_num >= max_passes or y_current > y_end:
@@ -1401,7 +1608,7 @@ class Visualization:
             
                 x = max(x_start, min(x, x_end))
             else:
-                # Vertical transition phase
+                # Vertical transition
                 vertical_progress = distance_in_pass - horizontal_distance
             
                 if pass_num % 2 == 0:
@@ -1427,7 +1634,6 @@ class Visualization:
                         y_crop=None, show_full_domain=True):
         """
         Compare temperature and gradient fields for raster scan vs. optimized scan.
-        Overlays scan paths and melt pool contours.
 
         Args:
             initial_params: dictionary of initial parameters
@@ -1443,7 +1649,7 @@ class Visualization:
         raster_config = self._setup_raster_scan()
         T_raster, grad_raster, raster_positions, raster_temporal_stats = self._simulate_raster_scan(raster_config)
 
-        # FIXED: Setup and simulate optimized scan - now returns ACTUAL positions used
+        # Setup and simulate optimized scan
         T_opt, grad_opt, laser_paths, opt_temporal_stats = self._simulate_optimized_scan(
             initial_params, optimized_params, use_gaussian
         )
@@ -1460,21 +1666,18 @@ class Visualization:
     
     def _setup_raster_scan(self):
         """Setup raster scan configuration with 1.5mm margins."""
-        x_start = 0.0015  # 1.5mm from left edge
-        x_end = self.model.Lx - 0.0015  # 1.5mm from right edge
+        x_start = 0.0015
+        x_end = self.model.Lx - 0.0015
         y_start, y_end = 0.0002, 0.0008
-        hatch_spacing = 0.00008  # Changed to 80 micrometers
+        hatch_spacing = 0.00008  # 80 um
         n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
-        raster_speed = 0.2
+        raster_speed = 0.7  # 700 mm/s
     
         raster_path, _ = self.generate_raster_scan(
             x_start, x_end, y_start, y_end, n_lines, raster_speed
         )
     
-        heat_params = (
-            {'Q': 200.0, 'r0': 0.00004},
-            {'Q': 200.0, 'r0': 0.00004}
-        )
+        heat_params = {'Q': 200.0, 'r0': 0.00004}
     
         return {
             'path': raster_path,
@@ -1502,33 +1705,24 @@ class Visualization:
         self.model.swirl_trajectory = raster_trajectory
 
         try:
-            raster_heat_params = (
-                {'Q': 200.0, 'r0': 0.00004},
-                {'Q': 200.0, 'r0': 0.00004}
-            )
+            raster_heat_params = {'Q': 200.0, 'r0': 0.00004}
         
-            raster_laser_params = (
-                {'type': 'sawtooth', 'params': {
-                    'v': raster_config['speed'], 'A': 0, 'y0': 0, 
-                    'period': 1, 'noise_sigma': 0
-                }},
-                {'type': 'swirl', 'params': {
-                    'v': raster_config['speed'], 'A': 0, 'y0': 0, 
-                    'fr': 1, 'noise_sigma': 0
-                }}
-            )
+            raster_laser_params = {'type': 'sawtooth', 'params': {
+                'v': raster_config['speed'], 'A': 0, 'y0': 0, 
+                'period': 1, 'noise_sigma': 0
+            }}
 
-            # Run simulation - this updates temporal_grad_stats
+            # Run simulation to update temporal_grad_stats
             T_raster = self.model.simulate(
                 (raster_laser_params, raster_heat_params), 
-                use_gaussian=True
+                use_gaussian=True,
+                nt=4000
             )
 
-            # FIXED: Calculate gradient from the FINAL temperature field
-            # This is what should be shown in the gradient plots
+            # Calculate gradient from final temperature field
             _, _, grad_raster = self.model.compute_temperature_gradients(T_raster)
         
-            # Get temporal statistics that were collected DURING simulation
+            # Get temporal statistics collected during simulation
             raster_temporal_stats = self.model.temporal_grad_stats
         
             # DIAGNOSTIC: Print to verify values
@@ -1564,9 +1758,9 @@ class Visualization:
     def _simulate_optimized_scan(self, initial_params, optimized_params, use_gaussian):
         """
         Simulate optimized scan and extract results.
-        NOW TRACKS ACTUAL LASER POSITIONS DURING SIMULATION.
+        NOW uses cached trajectories for consistent paths.
         """
-            # Setup optimizer and unpack parameters
+        # Setup optimizer and unpack parameters
         temp_optimizer = TrajectoryOptimizer(
             self.model, initial_params=initial_params, bounds=None
         )
@@ -1575,39 +1769,59 @@ class Visualization:
 
         # Determine heat source type
         if isinstance(heat_opt, (list, tuple)):
-            use_gaussian_opt = 'r0' in heat_opt[0]
+            use_gaussian_opt = 'r0' in heat_opt[0] or 'sigma_x' in heat_opt[0]
         else:
-            use_gaussian_opt = 'r0' in heat_opt
+            use_gaussian_opt = 'r0' in heat_opt or 'sigma_x' in heat_opt
 
-        # FIXED: Only reset ONCE, then track positions during simulation
-        # We'll modify simulate to track positions internally
-        # Store a flag to track positions
-        self.model._track_laser_positions = True
-        self.model._laser_position_history = {'straight': [], 'sawtooth': [], 'swirl': []}
-    
-        # Run simulation - this will track positions internally
+        # Run simulation to create cached trajectories
         T_opt = self.model.simulate((laser_opt, heat_opt), use_gaussian=use_gaussian_opt)
+
+        # Extract laser paths from the cached trajectories created during simulation
+        laser_paths = {'straight': [], 'sawtooth': [], 'swirl': []}
+
+        # Define boundary limits
+        x_start = 0.0015
+        x_end = self.model.Lx - 0.0015
+
+        if hasattr(self.model, '_cached_trajectories'):
+            cached_traj = self.model._cached_trajectories
     
-        # Extract the tracked positions
-        laser_paths = self.model._laser_position_history
-    
-        # Clean up tracking flags
-        self.model._track_laser_positions = False
-        self.model._laser_position_history = None
-    
+            # Check if dual laser config (list of trajectory lists)
+            # or single laser config (single trajectory list)
+            if isinstance(laser_opt, tuple):
+                # Multiple lasers - cached_traj is a list of trajectory lists
+                for i, laser_config in enumerate(laser_opt):
+                    traj_type = laser_config['type']
+                    trajectory_points = cached_traj[i]  # Get the i-th trajectory list
+            
+                    # Convert to mm and store active points (before boundary)
+                    for x, y, _, _ in trajectory_points:
+                        if x < x_end:
+                            laser_paths[traj_type].append((x * 1000, y * 1000))
+            else:
+                # Single laser - cached_traj is a single trajectory list
+                traj_type = laser_opt['type']
+        
+                # Convert to mm and store active points (before boundary)
+                for x, y, _, _ in cached_traj:
+                    if x < x_end:
+                        laser_paths[traj_type].append((x * 1000, y * 1000))
+
         # Calculate gradient from final temperature field
-        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt)
+        # For optimized scan, use temperature at laser finish (not after full diffusion)
+        T_opt_display = self.model.temporal_grad_stats.get('T_at_laser_finish', T_opt)
+        _, _, grad_opt = self.model.compute_temperature_gradients(T_opt_display)
         opt_temporal_stats = self.model.temporal_grad_stats
 
-        return T_opt, grad_opt, laser_paths, opt_temporal_stats
-
+        return T_opt_display, grad_opt, laser_paths, opt_temporal_stats
+    
     def _track_positions_during_simulation(self, laser_opt):
         """
-        Track laser positions using the SAME time evolution as the simulation.
-        This must be called AFTER reset() to use the same initial noise state.
+        Track laser positions using same time evolution as the simulation.
+        This must be called after reset() to use the same initial noise state.
         Only records positions while laser is actively scanning (not clamped at boundary).
         """
-        nt = 6000  # Must match self.model.nt in simulate()
+        nt = 4000  # Must match self.model.nt in simulate()
         dt = self.model.dt
         t_points = np.linspace(0, nt * dt, nt)
 
@@ -1625,20 +1839,20 @@ class Visualization:
             scan_complete = False
         
             for t in t_points:
-                # ALWAYS call trajectory function to maintain noise state sync
+                # Call trajectory function to maintain noise state sync
                 if laser['type'] == 'straight':
                     x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
                 elif laser['type'] == 'sawtooth':
                     x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
-                else:  # swirl
+                else:  # Swirl
                     x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
         
-                # Only record position if laser hasn't reached the end yet
+                # Only record position if laser hasn't reached end
                 if not scan_complete:
                     x_list.append(x * 1000)  # Convert to mm
                     y_list.append(y * 1000)
                 
-                    # Check if laser has reached the end boundary
+                    # Check if laser has reached end boundary
                     # Use a small tolerance to detect when clamping starts
                     if x >= (x_end - 1e-6):
                         scan_complete = True
@@ -1674,7 +1888,7 @@ class Visualization:
         for laser in laser_list:
             x_list, y_list = [], []
     
-            # FIXED: Reset noise state before extracting path to match simulation
+            # Reset noise state before extracting path to match simulation
             if laser['type'] == 'sawtooth':
                 if hasattr(self.model, '_noise_state'):
                     self.model._noise_state = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
@@ -1686,12 +1900,12 @@ class Visualization:
                     self.model._noise_state_straight = {'x': 0.0, 'y': 0.0, 'last_t': 0.0}
     
             for t in t_points:
-                # Get ACTUAL noisy position (same as what simulation used)
+                # Get noisy position
                 if laser['type'] == 'straight':
                     x, y, _, _ = self.model.straight_trajectory(t, laser['params'])
                 elif laser['type'] == 'sawtooth':
                     x, y, _, _ = self.model.sawtooth_trajectory(t, laser['params'])
-                else:  # swirl
+                else:  # Swirl
                     x, y, _, _ = self.model.swirl_trajectory(t, laser['params'])
         
                 x_list.append(x * 1000)  # Convert to mm
@@ -1732,15 +1946,11 @@ class Visualization:
         self._add_melt_pool_contours(ax1, T_raster, extent)
         self._add_melt_pool_contours(ax2, T_opt, extent)
 
-        # FIXED: Only add temporal statistics to TOP row (temperature plots)
-        # These show peak gradients that occurred during simulation
+        # Show peak gradients that occurred during simulation
         self._add_gradient_statistics(ax1, grad_raster, temporal_stats=raster_temporal_stats, 
                                       is_raster=True, label_type='temporal')
         self._add_gradient_statistics(ax2, grad_opt, temporal_stats=opt_temporal_stats, 
                                       is_raster=False, label_type='temporal')
-    
-        # Bottom row: NO labels (colorbar shows the scale)
-        # Do NOT call _add_gradient_statistics for ax3 and ax4
 
         return fig
     
@@ -1755,9 +1965,9 @@ class Visualization:
         return im
     
     def _plot_gradient_field(self, ax, grad_field, extent, title):
-        """Plot gradient field on given axis with correct units."""
-        # FIXED: Convert gradient field from °C/m to °C/mm for display
-        grad_field_mm = grad_field / 1000  # Convert °C/m to °C/mm
+        """Plot gradient field on given axis."""
+        # Convert gradient field from °C/m to °C/mm for display
+        grad_field_mm = grad_field / 1000
     
         grad_cmap = plt.get_cmap('viridis')
         im = ax.imshow(grad_field_mm, extent=extent, origin='lower', 
@@ -1785,30 +1995,39 @@ class Visualization:
     
     
     def _add_optimized_paths(self, temp_ax, grad_ax, laser_paths, optimized_params):
-        """Add optimized laser paths to temperature and gradient plots - NO END MARKERS."""
+        """Add optimized laser paths to temperature and gradient plots."""
         colors = ['red', 'black']
         laser_types = ['straight', 'sawtooth', 'swirl']
 
         laser_assignments = []
+    
         for laser_type in laser_types:
-            if laser_paths[laser_type]:
-                for path_idx, (x_list, y_list) in enumerate(laser_paths[laser_type]):
-                    color = colors[len(laser_assignments)]
-        
-                    # Plot the actual simulated path (already in mm)
-                    temp_ax.plot(x_list, y_list, color=color, linewidth=1)
-                    grad_ax.plot(x_list, y_list, color=color, linewidth=1)
-        
-                    # Create legend label
-                    heat_source_num = len(laser_assignments) + 1
-                    label = f"Heat Source {heat_source_num}: {laser_type.capitalize()}"
-        
-                    # Add legend entry
-                    temp_ax.plot([], [], color=color, linewidth=2, label=label)
-                    grad_ax.plot([], [], color=color, linewidth=2, label=label)
-        
-                    # REMOVED: No end position markers
-                    laser_assignments.append((laser_type, path_idx))
+            if laser_paths[laser_type]:  # If this laser type has points
+                # Extract x and y coordinates from the list of (x, y) tuples
+                x_list = [point[0] for point in laser_paths[laser_type]]
+                y_list = [point[1] for point in laser_paths[laser_type]]
+            
+                # Get color for this laser
+                color_idx = len(laser_assignments)
+                if color_idx >= len(colors):
+                    # Fallback color
+                    color = 'cyan'
+                else:
+                    color = colors[color_idx]
+            
+                # Plot actual simulated path
+                temp_ax.plot(x_list, y_list, color=color, linewidth=1)
+                grad_ax.plot(x_list, y_list, color=color, linewidth=1)
+            
+                # Create legend label
+                heat_source_num = len(laser_assignments) + 1
+                label = f"Heat Source {heat_source_num}: {laser_type.capitalize()}"
+            
+                # Add legend entry
+                temp_ax.plot([], [], color=color, linewidth=2, label=label)
+                grad_ax.plot([], [], color=color, linewidth=2, label=label)
+            
+                laser_assignments.append(laser_type)
 
         temp_ax.legend()
         grad_ax.legend()
@@ -1825,9 +2044,9 @@ class Visualization:
         """Add gradient statistics annotation to plot with correct unit conversions."""
     
         if label_type == 'temporal' and temporal_stats:
-            # FIXED: Temporal statistics are stored in °C/m, convert to °C/mm for display
-            max_grad_temporal = temporal_stats['max_over_time'] / 1000  # Convert °C/m to °C/mm
-            mean_grad_temporal = temporal_stats['mean_over_time'] / 1000  # Convert °C/m to °C/mm
+            # Temporal statistics stored in °C/m, convert to °C/mm for display
+            max_grad_temporal = temporal_stats['max_over_time'] / 1000
+            mean_grad_temporal = temporal_stats['mean_over_time'] / 1000
         
             stats_text = (
                 f"Peak Over Simulation:\n"
@@ -1835,9 +2054,9 @@ class Visualization:
                 f"Mean ∇T: {mean_grad_temporal:.2e} °C/mm"
             )
         else:
-            # FIXED: Final state statistics - grad_field is in °C/m, convert to °C/mm
-            max_grad_final = np.max(grad_field) / 1000  # Convert °C/m to °C/mm  
-            mean_grad_final = np.mean(grad_field) / 1000  # Convert °C/m to °C/mm
+            # Final state statistics - grad_field is in °C/m, convert to °C/mm
+            max_grad_final = np.max(grad_field) / 1000  
+            mean_grad_final = np.mean(grad_field) / 1000
         
             stats_text = (
                 f"Final State:\n"
@@ -1863,15 +2082,17 @@ class Visualization:
         """
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
     
-        # Time arrays (assuming same time steps)
-        nt = len(raster_temporal_stats['max_gradients'])
+        # Create separate time arrays for each scan (they may have different lengths)
         dt = self.model.dt
-        time_points = np.arange(nt) * dt
+        nt_raster = len(raster_temporal_stats['max_gradients'])
+        nt_opt = len(opt_temporal_stats['max_gradients'])
+        time_points_raster = np.arange(nt_raster) * dt
+        time_points_opt = np.arange(nt_opt) * dt
     
         # Plot maximum gradients over time
-        ax1.plot(time_points, np.array(raster_temporal_stats['max_gradients'])/1000, 
+        ax1.plot(time_points_raster, np.array(raster_temporal_stats['max_gradients'])/1000, 
                  'b-', label='Raster Scan', linewidth=2)
-        ax1.plot(time_points, np.array(opt_temporal_stats['max_gradients'])/1000, 
+        ax1.plot(time_points_opt, np.array(opt_temporal_stats['max_gradients'])/1000, 
                  'r-', label='Optimized Scan', linewidth=2)
         ax1.set_ylabel('Maximum ∇T (°C/mm)')
         ax1.set_title('Maximum Temperature Gradient Evolution')
@@ -1879,9 +2100,9 @@ class Visualization:
         ax1.grid(True, alpha=0.3)
     
         # Plot mean gradients over time
-        ax2.plot(time_points, np.array(raster_temporal_stats['mean_gradients'])/1000, 
+        ax2.plot(time_points_raster, np.array(raster_temporal_stats['mean_gradients'])/1000, 
                  'b-', label='Raster Scan', linewidth=2)
-        ax2.plot(time_points, np.array(opt_temporal_stats['mean_gradients'])/1000, 
+        ax2.plot(time_points_opt, np.array(opt_temporal_stats['mean_gradients'])/1000, 
                  'r-', label='Optimized Scan', linewidth=2)
         ax2.set_xlabel('Time (s)')
         ax2.set_ylabel('Mean ∇T (°C/mm)')
@@ -1964,21 +2185,20 @@ class Visualization:
         return ani
     
     def _setup_animation_config(self, initial_params, optimized_params, 
-                          save_snapshots, snapshot_interval, snapshot_dir):
+                            save_snapshots, snapshot_interval, snapshot_dir):
         """Setup configuration for animation with synchronized timing."""
         # Raster scan configuration
         raster_config = self._setup_raster_scan()
-        raster_speed = 0.2  # Raster scan speed
+        raster_speed = raster_config['speed']
         raster_config['speed'] = raster_speed
-    
         # Optimized scan configuration
         temp_optimizer = TrajectoryOptimizer(
             self.model, initial_params=initial_params, bounds=None
         )
         optimized_array = temp_optimizer.parameters_to_array(optimized_params)
         laser_opt, heat_opt = temp_optimizer.unpack_parameters(optimized_array)
-    
-        # FIXED: Calculate optimized scan speed to synchronize timing
+
+        # Calculate optimized scan speed to synchronize timing
         # Extract the actual scan speed from optimized parameters
         if isinstance(laser_opt, tuple):
             # Multiple lasers - use slowest speed for timing
@@ -1987,34 +2207,79 @@ class Visualization:
         else:
             # Single laser
             opt_speed = laser_opt['params']['v']
+
+        # Determine frame count from cached trajectories
+        dt = self.model.dt
+        if hasattr(self.model, '_cached_trajectories'):
+            cached_traj = self.model._cached_trajectories
+            if isinstance(cached_traj, list) and len(cached_traj) > 0:
+                if isinstance(cached_traj[0], list):
+                    # Multiple lasers - use maximum length
+                    nt = max(len(traj) for traj in cached_traj)
+                else:
+                    # Single laser
+                    nt = len(cached_traj)
+            else:
+                nt = 4000
+        else:
+            nt = 4000
     
-        # FIXED: Calculate scan distances for both scans
+        # Calculate scan distances and times
         x_start = raster_config['x_start']
         x_end = raster_config['x_end']
-        scan_distance = x_end - x_start  # Distance to cover
-    
-        # Calculate time required for each scan to complete
-        raster_time = scan_distance / raster_speed
-        opt_time = scan_distance / opt_speed
-    
-        # Use the LONGER time as the animation duration to show full scans
-        animation_duration = max(raster_time, opt_time)
-    
-        # FIXED: Set time step and number of steps based on animation duration
-        # Use a reasonable frame rate (30-60 fps equivalent)
-        dt = animation_duration / 6000  # 6000 frames for smooth animation
-        nt = 6000
-    
+        scan_distance = x_end - x_start  # Horizontal distance per pass
+        
+        # Calculate total raster scan time including all passes
+        # Raster scan parameters from _setup_raster_scan
+        y_start, y_end = 0.0002, 0.0008
+        hatch_spacing = 0.00008
+        n_lines = int(np.floor((y_end - y_start) / hatch_spacing)) + 1
+        
+        # Each pass includes horizontal scan and vertical move
+        horizontal_distance = scan_distance
+        vertical_distance = hatch_spacing
+        distance_per_pass = horizontal_distance + vertical_distance
+        total_raster_distance = n_lines * distance_per_pass
+        
+        raster_time = total_raster_distance / raster_speed
+        
+        # Calculate optimized scan actual path length
+        if hasattr(self.model, '_cached_trajectories'):
+            cached_traj = self.model._cached_trajectories
+            if isinstance(cached_traj, list) and isinstance(cached_traj[0], list):
+                # Multiple lasers - calculate first laser path length
+                opt_path_length = 0.0
+                for i in range(len(cached_traj[0]) - 1):
+                    x1, y1, _, _ = cached_traj[0][i]
+                    x2, y2, _, _ = cached_traj[0][i + 1]
+                    opt_path_length += np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            else:
+                # Single laser
+                opt_path_length = 0.0
+                for i in range(len(cached_traj) - 1):
+                    x1, y1, _, _ = cached_traj[i]
+                    x2, y2, _, _ = cached_traj[i + 1]
+                    opt_path_length += np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            opt_time = opt_path_length / opt_speed
+        else:
+            opt_path_length = scan_distance
+            opt_time = scan_distance / opt_speed
+
+        # Animation duration determined by the timesteps
+        animation_duration = nt * dt
+
         print(f"\nAnimation Timing:")
         print(f"  Raster scan speed: {raster_speed:.3f} m/s")
         print(f"  Optimized scan speed: {opt_speed:.3f} m/s")
-        print(f"  Scan distance: {scan_distance*1000:.2f} mm")
+        print(f"  Raster path length: {total_raster_distance*1000:.2f} mm")
+        print(f"  Optimized path length: {opt_path_length*1000:.2f} mm (with noise)")
         print(f"  Raster scan time: {raster_time:.3f} s")
         print(f"  Optimized scan time: {opt_time:.3f} s")
         print(f"  Animation duration: {animation_duration:.3f} s")
         print(f"  Time step (dt): {dt:.6f} s")
         print(f"  Number of frames: {nt}")
-    
+        print(f"  Note: With noise, path is longer so animation takes more time steps")
+
         # Snapshot configuration
         snapshot_frames = set()
         if save_snapshots:
@@ -2022,7 +2287,7 @@ class Visualization:
             snapshot_frames = set(
                 int(i * nt * snapshot_interval) for i in range(int(1/snapshot_interval) + 1)
             )
-    
+
         return {
             'raster_config': raster_config,
             'laser_opt': laser_opt,
@@ -2041,7 +2306,7 @@ class Visualization:
     
     def _check_scan_completion(self, t, scan_time, speed, x_start, x_end):
         """
-        Check if a scan has completed and return final position if so.
+        Check if scan has completed and return final position if so.
     
         Args:
             t: current time
@@ -2053,7 +2318,7 @@ class Visualization:
             tuple: (is_complete, final_x, final_y)
         """
         if t >= scan_time:
-            # Scan is complete - hold at final position
+            # Hold at final position if finished
             return True, x_end, 0.0005  # Return to center y position
         return False, None, None
 
@@ -2086,7 +2351,7 @@ class Visualization:
         # Extract laser positions and trajectories
         laser_positions = self._extract_animation_laser_positions(config)
     
-        # FIXED: Initialize path history arrays to track actual noisy positions
+        # Initialize path history arrays to track actual noisy positions
         return {
             'T_raster': T_raster,
             'T_opt': T_opt,
@@ -2150,38 +2415,48 @@ class Visualization:
         return update
     
     def _update_temperature_fields(self, frame, config, animation_data):
-        """Update temperature fields for current animation frame with truly continuous scanning."""
+        """Update temperature fields for current animation frame using pre-calculated trajectories."""
         dt = config['dt']
         t = frame * dt
 
-        # === INITIALIZE ON FIRST FRAME ===
+        # Initialise on first frame
         if frame == 0:
             animation_data['T_raster'] = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
             animation_data['T_opt'] = self.model.material['T0'] * np.ones((self.model.ny, self.model.nx))
-        
-            # FIXED: Initialize noise states for optimized trajectories
-            self.model.reset()
+    
+            # Use same cached trajectories from the simulation
+            if hasattr(self.model, '_cached_trajectories'):
+                print("Using cached trajectories from simulation")
+                animation_data['opt_trajectory_cache'] = self.model._cached_trajectories
+            else:
+                print("WARNING: No cached trajectories found! Running simulation first...")
+                # Run simulation to generate cache
+                self.model.simulate(
+                    (config['laser_opt'], config['heat_opt']),
+                    use_gaussian=True
+                )
+                if hasattr(self.model, '_cached_trajectories'):
+                    animation_data['opt_trajectory_cache'] = self.model._cached_trajectories
+                else:
+                    raise RuntimeError("Failed to generate trajectory cache")
 
-        # === RASTER SCAN UPDATE ===
+        # === RASTER Scan Update ===
         S_raster_total = 0
     
-        raster_complete, final_x, final_y = self._check_scan_completion(
-            t, config['raster_time'], config['raster_speed'],
-            config['raster_config']['x_start'], config['raster_config']['x_end']
-        )
-    
-        if raster_complete:
-            x_r, y_r = final_x, final_y
-        else:
-            # Calculate current position using trajectory function
+        raster_complete = False
+        if frame < len(animation_data['laser_positions']['raster_path']):
+            # Raster scan still active - use current frame position
             x_r, y_r, _, _ = animation_data['laser_positions']['raster_trajectory'](
                 t, {'v': config['raster_config']['speed'], 'noise_sigma': 0.0}
             )
         
             # Apply heat at current position
-            for heat_params in config['raster_config']['heat_params']:
-                S_r = self.model._gaussian_source(x_r, y_r, heat_params)
-                S_raster_total += S_r
+            heat_params = config['raster_config']['heat_params']
+            S_r = self.model._gaussian_source(x_r, y_r, heat_params)
+            S_raster_total += S_r
+        else:
+            # Raster has completed - no more heat input
+            raster_complete = True
 
         # Heat equation update for raster
         lap_r = self.model._laplacian(animation_data['T_raster'])
@@ -2192,44 +2467,36 @@ class Visualization:
         T_new_r = T_diff_r + source_increment_r
         animation_data['T_raster'] = self.model._apply_boundary_conditions(T_new_r)
     
-        # === OPTIMIZED SCAN UPDATE WITH CONTINUOUS TRAJECTORY CALCULATION ===
+        # === OPTIMIZED Scan Update ===
         S_opt_total = 0
         heat_opt = config['heat_opt']
-
-        opt_complete, final_x_opt, final_y_opt = self._check_scan_completion(
-            t, config['opt_time'], config['opt_speed'],
-            config['raster_config']['x_start'], config['raster_config']['x_end']
-        )
+        
+        # Define boundary limits
+        x_start_limit = 0.0015
+        x_end_limit = self.model.Lx - 0.0015
     
-        if not opt_complete:
-            if isinstance(config['laser_opt'], tuple):
-                # Multiple lasers - calculate each position at current time
-                for i, laser_config in enumerate(config['laser_opt']):
-                    # FIXED: Get position directly from trajectory function at time t
-                    # This automatically includes noise evolution up to time t
-                    if laser_config['type'] == 'straight':
-                        x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
-                    elif laser_config['type'] == 'sawtooth':
-                        x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
-                    else:  # swirl
-                        x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
-                
-                    heat_params = heat_opt[i] if isinstance(heat_opt, (list, tuple)) else heat_opt
-                
-                    # Apply heat at current position
+        if isinstance(config['laser_opt'], tuple):
+            # Multiple lasers - use cached trajectories
+            for i, laser_config in enumerate(config['laser_opt']):
+                # Get position from cache
+                x, y, _, _ = animation_data['opt_trajectory_cache'][i][frame]
+        
+                # Check if laser is within valid range
+                laser_active = x_start_limit <= x <= x_end_limit
+        
+                heat_params = heat_opt[i] if isinstance(heat_opt, (list, tuple)) else heat_opt
+
+                if laser_active:
                     S = self.model._gaussian_source(x, y, heat_params)
                     S_opt_total += S
-            else:
-                # Single laser - calculate position at current time
-                laser_config = config['laser_opt']
-                if laser_config['type'] == 'straight':
-                    x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
-                elif laser_config['type'] == 'sawtooth':
-                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
-                else:  # swirl
-                    x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
-            
-                # Apply heat at current position
+        else:
+            # Single laser - use cached trajectory
+            x, y, _, _ = animation_data['opt_trajectory_cache'][frame]
+    
+            # Check if laser is within valid range
+            laser_active = x_start_limit <= x <= x_end_limit
+    
+            if laser_active:
                 S_opt_total = self.model._gaussian_source(x, y, heat_opt)
 
         # Heat equation update for optimized scan
@@ -2264,14 +2531,14 @@ class Visualization:
         axes_config['ax2'].set_xlabel('X (mm)')
         axes_config['ax2'].set_ylabel('Y (mm)')
     
-        # Add laser position markers using corrected trajectory functions
+        # Add laser position markers
         self._add_animation_laser_markers(frame, config, axes_config, animation_data)
     
         # Add temperature annotations
         self._add_animation_temperature_annotations(axes_config, animation_data)
     
     def _add_animation_laser_markers(self, frame, config, axes_config, animation_data):
-        """Add laser position markers to animation frame using corrected positions."""
+        """Add laser position markers to animation frame using pre-calculated positions."""
         dt = config['dt']
         t = frame * dt
     
@@ -2281,31 +2548,22 @@ class Visualization:
         )
         axes_config['ax1'].plot(x_r * 1000, y_r * 1000, 'ko', markersize=8, label='Raster Laser')
     
-        # Optimized laser positions using corrected trajectories
+        # Optimized laser positions using pre-calculated trajectories
         colors = ['red', 'black']
         color_codes = ['ro', 'ko']
     
         if isinstance(config['laser_opt'], tuple):
-            # Multiple lasers
+            # Multiple lasers - use cached positions
             for i, laser_config in enumerate(config['laser_opt']):
-                if laser_config['type'] == 'straight':
-                    x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
-                elif laser_config['type'] == 'sawtooth':
-                    x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
-                else:  # swirl
-                    x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+                frame_idx = min(frame, len(animation_data['opt_trajectory_cache'][i]) - 1)
+                x, y, _, _ = animation_data['opt_trajectory_cache'][i][frame_idx]
             
                 color_code = color_codes[i % len(color_codes)]
                 axes_config['ax2'].plot(x * 1000, y * 1000, color_code, markersize=8)
         else:
-            # Single laser
-            laser_config = config['laser_opt']
-            if laser_config['type'] == 'straight':
-                x, y, _, _ = self.model.straight_trajectory(t, laser_config['params'])
-            elif laser_config['type'] == 'sawtooth':
-                x, y, _, _ = self.model.sawtooth_trajectory(t, laser_config['params'])
-            else:  # swirl
-                x, y, _, _ = self.model.swirl_trajectory(t, laser_config['params'])
+            # Single laser - use cached position
+            frame_idx = min(frame, len(animation_data['opt_trajectory_cache']) - 1)
+            x, y, _, _ = animation_data['opt_trajectory_cache'][frame_idx]
         
             axes_config['ax2'].plot(x * 1000, y * 1000, 'ro', markersize=8)
     
@@ -2318,7 +2576,7 @@ class Visualization:
         colors = ['red', 'black']  # Heat Source 1: red, Heat Source 2: black
         
         if isinstance(laser_opt, tuple):
-            # Multiple lasers - use consistent numbering
+            # Multiple lasers
             for i, laser in enumerate(laser_opt):
                 if i < len(laser_positions):  # Only add legend if laser is active
                     color = colors[i % len(colors)]
@@ -2427,7 +2685,7 @@ class OptimizationRunner:
     """
     
     def __init__(self):
-        """Initialize optimization runner with default configurations."""
+        """Initialize with default configurations."""
         self.model = None
         self.optimizer = None
         self.result = None
@@ -2453,7 +2711,7 @@ class OptimizationRunner:
     
     def get_user_configuration(self):
         """
-        Collect user preferences for optimization configuration.
+        Collect user instructions for optimization configuration.
         
         Returns:
             dict: configuration dictionary with user choices
@@ -2528,7 +2786,7 @@ class OptimizationRunner:
     
     def setup_model(self):
         """
-        Initialize heat transfer model with LPBF-appropriate parameters.
+        Initialize heat transfer model.
         
         Returns:
             HeatTransferModel: configured model instance
@@ -2556,14 +2814,14 @@ class OptimizationRunner:
             'cp': 500.0,               # Specific heat capacity (J/(kg·K))
             'k': 20.0,                 # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,          # Melting temperature (°C)
-            'thickness': 0.02,      # Plate thickness (m)
+            'thickness': 0.005,        # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0        # Absorptivity (fraction)
         }
     
     def _get_domain_configuration(self):
         """Get domain and discretization parameters."""
         return {
-            'domain_size': (0.008, 0.001),     # Domain size (m)
+            'domain_size': (0.008, 0.001),     # Domain size (m) - 8mm x 1mm
             'grid_size': (401, 51),            # Grid resolution
             'dt': 1e-5                         # Time step (s)
         }
@@ -2632,22 +2890,22 @@ class OptimizationRunner:
         prefix = f'sawtooth{suffix}'
         
         initial_params = {
-            f'{prefix}_v': 0.05,
-            f'{prefix}_A': 0.0002,
+            f'{prefix}_v': 0.7,
+            f'{prefix}_A': 0.0003,
             f'{prefix}_y0': 0.0005,
-            f'{prefix}_period': 0.01,
+            f'{prefix}_period': 0.002,
             f'{prefix}_Q': 200.0,
             f'{prefix}_r0': 4e-5,
         }
         
         bounds = {
-            f'{prefix}_v': (0.01, 0.1),
-            f'{prefix}_A': (0.00005, 0.00025),
-            f'{prefix}_period': (0.01, 0.05),
-            f'{prefix}_Q': (50.0, 500.0),
+            f'{prefix}_v': (0.55, 0.85),
+            f'{prefix}_A': (0.00025, 0.0004),
+            f'{prefix}_period': (0.001, 0.003),
+            f'{prefix}_Q': (175.0, 225.0),
         }
 
-        # Add y0 as a fixed parameter (not optimized)
+        # Add y0 as a fixed parameter
         initial_params[f'{prefix}_y0'] = 0.0005
         
         return initial_params, bounds
@@ -2657,19 +2915,19 @@ class OptimizationRunner:
         prefix = f'swirl{suffix}'
         
         initial_params = {
-            f'{prefix}_v': 0.05,
-            f'{prefix}_A': 0.0002,
+            f'{prefix}_v': 0.7,
+            f'{prefix}_A': 0.0005,
             f'{prefix}_y0': 0.0005,
-            f'{prefix}_fr': 20.0,
+            f'{prefix}_fr': 900.0,
             f'{prefix}_Q': 200.0,
             f'{prefix}_r0': 4e-5,
         }
         
         bounds = {
-            f'{prefix}_v': (0.01, 0.1),
-            f'{prefix}_A': (0.00005, 0.00025),
-            f'{prefix}_fr': (5.0, 20.0),
-            f'{prefix}_Q': (50.0, 500.0),
+            f'{prefix}_v': (0.55, 0.85),
+            f'{prefix}_A': (0.0004, 0.0006),
+            f'{prefix}_fr': (700.0, 1100.0),
+            f'{prefix}_Q': (175.0, 225.0),
         }
         
         initial_params[f'{prefix}_y0'] = 0.0005
@@ -2681,15 +2939,15 @@ class OptimizationRunner:
         prefix = f'straight{suffix}'
     
         initial_params = {
-            f'{prefix}_v': 0.05,
+            f'{prefix}_v': 0.7,
             f'{prefix}_y0': 0.0005,
             f'{prefix}_Q': 200.0,
             f'{prefix}_r0': 4e-5,
         }
     
         bounds = {
-            f'{prefix}_v': (0.01, 0.06),
-            f'{prefix}_Q': (175.0, 250.0),
+            f'{prefix}_v': (0.55, 0.85),
+            f'{prefix}_Q': (175.0, 225.0),
         }
 
         initial_params[f'{prefix}_y0'] = 0.0005
@@ -2712,7 +2970,7 @@ class OptimizationRunner:
         Returns:
             tuple: (TrajectoryOptimizer, optimization_result, optimized_params)
         """
-        # Create optimizer with updated scan region (2.5mm margins)
+        # Create optimizer with updated scan region
         optimizer = TrajectoryOptimizer(
             model=model,
             initial_params=initial_params,
@@ -2778,7 +3036,7 @@ class OptimizationRunner:
                     max_iterations=self.default_max_iterations
                 )
             else:
-                # If Nelder-Mead also fails, return failed result
+                # If fallback also fails, return failed result
                 from scipy.optimize import OptimizeResult
                 failed_result = OptimizeResult(
                     success=False,
@@ -2899,7 +3157,7 @@ class OptimizationRunner:
         viz = Visualization(model)
         viz.compare_simulations(initial_params, optimized_params)
     
-        # Also generate temporal gradient evolution plot
+        # Generate temporal gradient evolution plot
         create_temporal_plot = input("Generate temporal gradient evolution plot? (y/n): ").lower()
         if create_temporal_plot == 'y':
             print("Generating temporal gradient analysis...")
@@ -2981,10 +3239,11 @@ class OptimizationRunner:
             return None, None, None, None
         
         except Exception as e:
+            import traceback
             print(f"\nUnexpected error during optimization: {str(e)}")
+            print("\nFull traceback:")
+            traceback.print_exc()
             print("Please check your inputs and try again.")
-            return None, None, None, None
-
 
 def run_optimization():
     """
@@ -3002,10 +3261,7 @@ def run_optimization():
 
 class GCodeGenerator:
     """
-    G-code generation utility for optimized laser trajectories.
-    
-    Converts optimized laser paths to G-code format suitable for
-    CNC machines or laser systems with proper formatting and metadata.
+    G-code generation for optimized laser trajectories.
     """
     
     def __init__(self, units='mm', positioning='absolute'):
@@ -3361,7 +3617,7 @@ class GCodeGenerator:
         unit_multiplier = 1000 if self.units == 'mm' else 39.3701
         precision = self.config['precision']
         
-        # Move to start position (rapid move)
+        # Move to start position
         x_start, y_start = path[0] * unit_multiplier
         file.write(f"G0 X{x_start:.{precision}f} Y{y_start:.{precision}f} ; Rapid to start\n")
         file.write("M3 ; Laser ON\n")
