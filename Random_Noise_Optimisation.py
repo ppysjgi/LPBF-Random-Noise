@@ -27,7 +27,7 @@ class HeatTransferModel:
     trajectories with optional noise.
     """
     
-    def __init__(self, domain_size=(0.02, 0.0025), grid_size=(401, 51), dt=1e-4, material_params=None, noise_seed=None):
+    def __init__(self, domain_size=(0.0225, 0.0025), grid_size=(1126, 51), dt=1e-4, material_params=None, noise_seed=None):
         """
         Initialize the heat transfer model.
     
@@ -83,7 +83,7 @@ class HeatTransferModel:
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.005,   # Grid thickness (m - define volume of cells)
+            'thickness': 0.0042,  # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0   # Absorptivity (fraction)
         }
         
@@ -2811,15 +2811,15 @@ class OptimizationRunner:
             'cp': 500.0,               # Specific heat capacity (J/(kg·K))
             'k': 20.0,                 # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,          # Melting temperature (°C)
-            'thickness': 0.005,        # Grid thickness (m - define volume of cells)
+            'thickness': 0.0042,       # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0        # Absorptivity (fraction)
         }
     
     def _get_domain_configuration(self):
         """Get domain and discretization parameters."""
         return {
-            'domain_size': (0.008, 0.001),     # Domain size (m) - 8mm x 1mm
-            'grid_size': (401, 51),            # Grid resolution
+            'domain_size': (0.0225, 0.001),    # Domain size (m) - 22.5mm x 1mm
+            'grid_size': (1126, 51),           # Grid resolution (same dx)
             'dt': 1e-5                         # Time step (s)
         }
     
