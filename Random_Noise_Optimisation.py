@@ -83,7 +83,7 @@ class HeatTransferModel:
             'cp': 500.0,          # Specific heat capacity (J/(kg·K))
             'k': 20.0,            # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,     # Melting temperature (°C)
-            'thickness': 0.005,   # Grid thickness (m - define volume of cells)
+            'thickness': 0.0042,  # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0   # Absorptivity (fraction)
         }
         
@@ -2811,7 +2811,7 @@ class OptimizationRunner:
             'cp': 500.0,               # Specific heat capacity (J/(kg·K))
             'k': 20.0,                 # Thermal conductivity (W/(m·K))
             'T_melt': 1500.0,          # Melting temperature (°C)
-            'thickness': 0.005,        # Grid thickness (m - define volume of cells)
+            'thickness': 0.0042,       # Grid thickness (m - define volume of cells)
             'absorptivity': 1.0        # Absorptivity (fraction)
         }
     
